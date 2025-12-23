@@ -1,0 +1,115 @@
+name: Test
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - "**"
+      - "!docs/**"
+      - "!**.md"
+  pull_request:
+    paths:
+      - "**"
+      - "!docs/**"
+      - "!**.md"
+
+jobs:
+  Build:
+    strategy:
+      fail-fast: false
+      matrix:
+        # 本库零依赖且 go.mod 声明 go 1.20，因此矩阵从 1.20 起算：
+        # 压低语言版本的意义就在于能被老工具链的项目引用，这条必须真的被验证
+        # [EN] The matrix starts at 1.20 because that is what go.mod declares; a
+        # deliberately low language version is only meaningful if it is tested
+        go-version: ["1.20.x", "1.21.x", "1.22.x", "1.23.x", "1.25.x"]
+        platform: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Fetch Repository
+        uses: actions/checkout@v5
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+
+      - name: Verify no third-party dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 使用者编译本库时第三方包数必须为 0，这是本库的核心承诺
+          # go list -deps 会带上本模块自身，故过滤掉后必须为空
+          # [EN] The core promise is that consumers compile no third-party
+          # package; go list -deps includes this module itself, so filtering it
+          # out must leave nothing behind
+          deps="$(go list -deps -f '{{if .Module}}{{.Module.Path}}{{end}}' . \
+            | sort -u | grep -v '^$' | grep -v '^github.com/kamalyes/go-desensitize$' || true)"
+          if [ -n "${deps}" ]; then
+            echo "::error::检测到第三方依赖，本库必须保持零依赖："
+            echo "${deps}"
+            exit 1
+          fi
+          echo "✅ 零第三方依赖"
+
+      - name: Check gofmt
+        shell: bash
+        run: |
+          set -euo pipefail
+          unformatted="$(gofmt -l . || true)"
+          if [ -n "${unformatted}" ]; then
+            echo "::error::以下文件未经 gofmt 格式化："
+            echo "${unformatted}"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Install gotestsum
+        run: go install gotest.tools/gotestsum@latest
+
+      - name: Test with race detector
+        run: gotestsum -f testname -- ./... -race -count=1 -shuffle=on -timeout=10m
+
+      - name: Test with coverage
+        run: go test ./... -count=1 -coverprofile=coverage.txt -covermode=atomic -timeout=10m
+
+      - name: Enforce 100% statement coverage
+        if: matrix.platform == 'ubuntu-latest' && matrix.go-version == '1.25.x'
+        shell: bash
+        run: |
+          set -euo pipefail
+          total="$(go tool cover -func=coverage.txt | tail -n 1 | awk '{print $NF}' | tr -d '%')"
+          echo "语句覆盖率：${total}%"
+          # 覆盖率是本库写进 README 的承诺，用闸门守住而不是靠人记得去看
+          # 不可达的防御分支已通过可注入的函数变量留出缝隙，因此 100% 是可达目标
+          # [EN] The coverage figure is a promise made in the README, so a gate
+          # holds it rather than relying on someone remembering to look.
+          # Unreachable defensive branches sit behind injectable seams, so 100%
+          # is an achievable target rather than an aspiration
+          if [ "${total}" != "100.0" ]; then
+            echo "::error::语句覆盖率为 ${total}%，要求 100.0%"
+            go tool cover -func=coverage.txt | grep -v '100.0%$' || true
+            exit 1
+          fi
+
+      - name: Build benchmarks
+        shell: bash
+        run: |
+          # 只编译并各跑一次，确认基准没写坏
+          # 不在 CI 里采信性能数字：共享 runner 的噪声远大于真实差异
+          # [EN] Compile and run each benchmark once to prove they still work.
+          # CI performance numbers are not trusted: shared-runner noise dwarfs
+          # any real difference
+          go test -run='^$' -bench='.' -benchtime=1x -timeout=10m .
+
+      - name: Upload coverage reports to Codecov
+        if: matrix.platform == 'ubuntu-latest' && matrix.go-version == '1.25.x'
+        uses: codecov/codecov-action@v4.5.0
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          file: ./coverage.txt
+          flags: unittests
+          slug: kamalyes/go-desensitize

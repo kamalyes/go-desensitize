@@ -1,0 +1,87 @@
+name: Trigger Downstream
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      should-dispatch: ${{ steps.filter.outputs.should-dispatch }}
+    steps:
+      - name: Fetch Repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Check changed files
+        id: filter
+        shell: bash
+        run: |
+          current_tag="${GITHUB_REF_NAME}"
+          previous_tag="$(git tag --sort=-v:refname | grep -v "^${current_tag}$" | head -n 1 || true)"
+
+          if [ -z "${previous_tag}" ]; then
+            echo "should-dispatch=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          changed_files="$(git diff --name-only "${previous_tag}..${current_tag}")"
+          if [ -z "${changed_files}" ]; then
+            echo "should-dispatch=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if echo "${changed_files}" | grep -Ev '(^docs/|\.md$)' >/dev/null; then
+            echo "should-dispatch=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should-dispatch=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  dispatch:
+    needs: changes
+    if: needs.changes.outputs.should-dispatch == 'true'
+    runs-on: ubuntu-latest
+    # 跨仓派发必须用 PAT 或 GitHub App token：GITHUB_TOKEN 只对当前仓库有权限，
+    # 用它调别的仓库的 dispatch 接口会被拒
+    # secrets 上下文不能直接写在 if 里，所以先落到 job 级 env 再判断，
+    # 未配置时让步骤跳过而不是整条工作流以
+    # "Parameter token or opts.auth is required" 变红
+    # [EN] Cross-repository dispatch needs a PAT or App token; GITHUB_TOKEN is
+    # scoped to this repository only. The secrets context cannot be used in an
+    # if expression, so it is surfaced as a job-level env and checked there,
+    # which skips the step instead of failing the whole workflow when unset
+    env:
+      DISPATCH_TOKEN: ${{ secrets.GH_GPA_TOKEN }}
+    strategy:
+      matrix:
+        repo:
+          # go-logger 直接引用本库的字段名规则表，是最主要的下游
+          # [EN] go-logger consumes the field-name rule tables directly
+          - kamalyes/go-logger
+          # go-rpc-gateway 使用 DataMasker 给 HTTP 请求响应体脱敏
+          - kamalyes/go-rpc-gateway
+          # go-sqlbuilder 在仓储层按 tag 脱敏
+          - kamalyes/go-sqlbuilder
+    steps:
+      - name: Warn when dispatch token is missing
+        if: env.DISPATCH_TOKEN == ''
+        run: |
+          echo "::warning::未配置 GH_GPA_TOKEN，跳过向 ${{ matrix.repo }} 的派发；\
+          下游不会自动升级本库版本，需要手动执行 go get 并提交"
+
+      - name: Dispatch to ${{ matrix.repo }}
+        if: env.DISPATCH_TOKEN != ''
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ env.DISPATCH_TOKEN }}
+          repository: ${{ matrix.repo }}
+          event-type: upstream-updated
+          client-payload: >-
+            {"module":"github.com/kamalyes/go-desensitize","version":"${{ github.ref_name }}","sha":"${{ github.sha }}","commit_message":"📦 deps: 同步上游依赖 ${{ github.ref_name }}\n\n- 📦 更新 github.com/kamalyes/go-desensitize 到 ${{ github.ref_name }} (go.mod, go.sum)\n- 🔄 自动联动下游版本标签 (bump-upstream.yml)\n\nsync upstream ${{ github.ref_name }}"}

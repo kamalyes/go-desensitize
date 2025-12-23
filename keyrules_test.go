@@ -19,6 +19,7 @@
 package desensitize
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -411,4 +412,128 @@ func TestAppendMasked_ZeroAllocIntoBuffer(t *testing.T) {
 		_ = b
 	})
 	assert.Zero(t, allocs, "追加器写入既有缓冲时应零分配，实测 %v", allocs)
+}
+
+// ==== 指纹与判定覆盖 | Fingerprint and overrides ====
+
+// TestAppendFingerprint 指纹掩码：稳定、不可逆、可关联
+func TestAppendFingerprint(t *testing.T) {
+	const sess = "sess-abc123def456"
+
+	a := FingerprintString(sess)
+	b := FingerprintString(sess)
+	assert.Equal(t, a, b, "同一输入必须恒产出同一串，否则无法跨行关联")
+	assert.True(t, strings.HasPrefix(a, "***"))
+	assert.Len(t, a, 3+fingerprintHexLen)
+	assert.NotContains(t, a, sess, "指纹里不得出现原值")
+
+	// 不同输入产出不同指纹
+	assert.NotEqual(t, a, FingerprintString("sess-other"))
+	// 仅一位之差也要不同
+	assert.NotEqual(t, a, FingerprintString("sess-abc123def457"))
+
+	// 空值整体擦除：对空值算指纹没有意义，且会暴露「这里本来是空」
+	assert.Equal(t, RedactedText, FingerprintString(""))
+	assert.Equal(t, RedactedText, string(AppendFingerprint(nil, "")))
+
+	// 追加语义
+	assert.Equal(t, "sid="+a, string(AppendFingerprint([]byte("sid="), sess)))
+
+	// 十六进制字符集
+	for _, c := range a[3:] {
+		assert.True(t, (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'),
+			"指纹应为小写十六进制，实得 %q", a)
+	}
+}
+
+// TestAppendFingerprint_ZeroAllocIntoBuffer 追加到足量缓冲时不分配
+func TestAppendFingerprint_ZeroAllocIntoBuffer(t *testing.T) {
+	buf := make([]byte, 0, 64)
+	allocs := testing.AllocsPerRun(200, func() {
+		_ = AppendFingerprint(buf[:0], "sess-abc123def456")
+	})
+	assert.Zero(t, allocs, "指纹追加器应零分配，实测 %v", allocs)
+}
+
+// TestOverrideKeyAction 覆盖判定结果
+func TestOverrideKeyAction(t *testing.T) {
+	// 前置条件：session_id 默认整体擦除
+	assert.Equal(t, WipeValue, ActionForKey("session_id"))
+	t.Cleanup(func() { OverrideKeyAction("session_id", WipeValue) })
+
+	// 调成指纹，换回关联能力
+	OverrideKeyAction("session_id", MaskFingerprint)
+	assert.Equal(t, MaskFingerprint, ActionForKey("session_id"))
+	// 归一化形态一并生效
+	assert.Equal(t, MaskFingerprint, ActionForKey("sessionId"))
+	assert.Equal(t, MaskFingerprint, ActionForKey("SESSION-ID"))
+
+	// 调成可还原加密
+	OverrideKeyAction("session_id", MaskEncrypt)
+	assert.Equal(t, MaskEncrypt, ActionForKey("session_id"))
+
+	// 也能调成明文，但这意味着把可重放的凭据写进日志
+	OverrideKeyAction("session_id", KeepAsIs)
+	assert.Equal(t, KeepAsIs, ActionForKey("session_id"))
+	assert.False(t, IsCredentialKey("session_id"))
+
+	// 复原
+	OverrideKeyAction("session_id", WipeValue)
+	assert.Equal(t, WipeValue, ActionForKey("session_id"))
+}
+
+// TestOverrideKeyAction_NewKey 覆盖一个原本不在表里的字段名
+func TestOverrideKeyAction_NewKey(t *testing.T) {
+	const key = "my_login_handle"
+	assert.Equal(t, KeepAsIs, ActionForKey(key), "前置条件")
+	t.Cleanup(func() { UnregisterSensitiveKeys(key) })
+
+	OverrideKeyAction(key, MaskFingerprint)
+	assert.Equal(t, MaskFingerprint, ActionForKey(key))
+}
+
+// TestOverrideKeyAction_Invalid 非法输入是无操作
+func TestOverrideKeyAction_Invalid(t *testing.T) {
+	OverrideKeyAction("", MaskFingerprint)
+	OverrideKeyAction("___", MaskFingerprint)
+	assert.Equal(t, KeepAsIs, ActionForKey(""))
+
+	long := ""
+	for i := 0; i < maxNormalizedKeyLen+5; i++ {
+		long += "q"
+	}
+	OverrideKeyAction(long, MaskFingerprint)
+	assert.Equal(t, KeepAsIs, ActionForKey(long))
+}
+
+// TestSessionKeysDefaultToWipe 会话类字段的默认判定必须是整体擦除
+//
+// 这条是安全基线的回归闸门：session_id、token 是可重放的凭据，
+// 日志被集中收集、很多人能读、保留数月，默认明文等于每行日志都是一次凭据投放
+// 需要关联能力的使用者应当显式 OverrideKeyAction 成指纹或加密，
+// 而不是由本库替所有人把默认放宽
+//
+// [EN] A regression gate on the security baseline: session ids and tokens are
+// replayable credentials, and logs are centrally collected, widely read and
+// retained for months. Callers who need correlation opt in explicitly rather
+// than having the default loosened for everyone
+func TestSessionKeysDefaultToWipe(t *testing.T) {
+	for _, k := range []string{
+		"session", "session_id", "sessid", "jsessionid", "phpsessid",
+		"token", "access_token", "refresh_token", "id_token", "jwt",
+		"cookie", "set_cookie", "authorization", "bearer_token",
+	} {
+		t.Run(k, func(t *testing.T) {
+			assert.Equal(t, WipeValue, ActionForKey(k),
+				"会话类字段 %q 默认必须整体擦除", k)
+		})
+	}
+
+	// 对照：关联标识默认可见，否则日志失去排障价值
+	for _, k := range []string{"trace_id", "span_id", "request_id", "user_id", "device_id"} {
+		t.Run("可见/"+k, func(t *testing.T) {
+			assert.Equal(t, KeepAsIs, ActionForKey(k),
+				"关联标识 %q 默认必须可见", k)
+		})
+	}
 }

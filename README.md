@@ -48,6 +48,7 @@ These defaults change production behaviour directly, so read them before wiring 
 | **`MaskerConfig.SensitiveKeys` is additive** | built-in rules always apply | configuration cannot make `password` non-sensitive — the security baseline must not narrow by accident |
 | Payload cap = 10KB | truncate first, then mask | a truncated body is usually no longer valid JSON and falls to the text path; raise it with `WithMaxBodySize(n)` |
 | Field-name decisions = two strengths | strict for logs, loose for payloads | the wrong one both over-masks and under-masks; see the table below |
+| **Sessions and tokens are wiped by default** | `session_id`, `token`, `cookie` and `authorization` are not visible | they are replayable credentials; when you need correlation or incident identification, move them to fingerprint or encryption with `OverrideKeyAction` rather than to plaintext |
 | **Models skip the heuristics** | only `desensitize` tags are honoured | the rule table is tuned for logs, and choices like `name` or `status_code` are wrong for a model |
 | Masking is one-way | the `Desensitize` family discards hidden characters | use the `cipher` tag for fields you must recover; a mask cannot be undone |
 | **`BankCard` is not idempotent** | each pass inserts grouping spaces and re-pads, so it grows | the only one of the twelve types that is not; masking once in middleware and again in a repository produces ever longer garbage, so make sure it happens once |
@@ -170,6 +171,50 @@ plain, err := desensitize.DefaultCipher().Decrypt(order.Receiver) // "张三丰"
 
 > ⚠️ **There is no default key**, because both kinds of default are worse than none: a hard-coded key is security theatre that anyone holding this source can undo, and a per-process random key silently destroys data at the next restart
 > Using the `cipher` tag without a configured key **wipes** the field rather than leaving plaintext — forgetting to configure must mean "no data visible", never "thought it was encrypted"
+
+### Sessions and tokens: correlation, identification, exposure
+
+`session_id`, `token`, `cookie` and `authorization` are **wiped** by default, deliberately:
+they are replayable credentials, and logs are centrally collected, widely read and retained
+for months, so anyone who can read them can impersonate the user until expiry, without a trace
+
+Two operational needs pull the other way: **following one login's requests across log lines**,
+and **identifying who it actually was** during an incident. Two middle options cover them,
+selected per field with `OverrideKeyAction`:
+
+| Approach | Correlate | Identify in an incident | Needs a key | Exposure |
+|------|:--------:|:------------:|:--------:|----------|
+| `KeepAsIs` (plaintext) | ✅ | ✅ | no | **replayable credential** |
+| `WipeValue` (default) | ❌ | ❌ | no | none |
+| `MaskFingerprint` | ✅ | ❌ | no | reveals only that two values are equal |
+| `MaskEncrypt` | ✅ | ✅ | yes | reveals only that two values are equal |
+
+```go
+// Just follow one session's requests; no key needed
+desensitize.OverrideKeyAction("session_id", desensitize.MaskFingerprint)
+// {"session_id":"***6a9f3e7a","trace_id":"t-xyz","user_id":"u-1001"}
+// Every line of that session reads ***6a9f3e7a, yet it cannot be inverted or replayed
+
+// Also be able to resolve which session it was during a review
+desensitize.SetDefaultCipher(key)
+desensitize.OverrideKeyAction("session_id", desensitize.MaskEncrypt)
+// {"session_id":"enc:v1:lFDr0e-L0k777_lQwKkRY8DPwvQek601DxXD10...","trace_id":"t-xyz"}
+
+plain, _ := desensitize.DefaultCipher().Decrypt(sealed) // "sess-abc123def456"
+```
+
+`MaskEncrypt` uses **deterministic** encryption (the nonce is HMAC-derived from the plaintext,
+an SIV construction), so one session is one ciphertext on every line. With a random nonce the
+identity would still be recoverable but the correlation would be gone
+
+Three things to know:
+
+- Both strengths necessarily reveal that two values are equal, which is exactly what makes them
+  correlatable; use `WipeValue` when even that must not leak
+- With no key configured, `MaskEncrypt` **wipes** the field rather than passing it through: you
+  asked for recoverable, not visible, and a misconfiguration must not leak silently
+- Often none of this is needed - `user_id`, `trace_id`, `request_id`, `span_id` and `device_id`
+  are visible by default, and following a user's request chain works with those alone
 
 ### Payload masking
 
@@ -367,6 +412,9 @@ go-desensitize/
 | `ActionForKeyLoose(key) KeyAction` | loose: also scans roots embedded in the name, allocation-free |
 | `IsCredentialKey(key) bool` | whether the name denotes a credential to wipe entirely |
 | `RegisterSensitiveKeys(keys...)` | add custom sensitive field names, process-wide |
+| `OverrideKeyAction(key, action)` | override one key's decision, e.g. moving session fields to fingerprint or encryption |
+| `AppendFingerprint(buf, s) []byte` | fingerprint appender: stable, non-invertible, allocation-free |
+| `FingerprintString(s) string` | the string form of the fingerprint mask |
 | `AppendMaskedPhone(buf, s) []byte` | phone mask appender, allocation-free into an existing buffer |
 | `AppendMaskedEmail(buf, s) []byte` | email mask appender, likewise |
 
@@ -378,6 +426,7 @@ go-desensitize/
 | `(*DataMasker).Mask(body) string` | mask a whole payload: structured for JSON, a single text pass otherwise |
 | `SetDefaultCipher(key) error` | configure the global key at startup; `desensitize:"cipher"` then works |
 | `(*Cipher).Encrypt / Decrypt` | marked encryption and decryption; an altered ciphertext fails rather than lies |
+| `(*Cipher).EncryptDeterministic(s) string` | deterministic encryption: one plaintext is always one ciphertext, so it correlates |
 | `(*Cipher).EncryptStruct / DecryptStruct` | whole-struct round trip; decryption needs only the marker, not a registry |
 | `IsEncrypted(v) bool` | whether a value carries this library's marker, no key required |
 

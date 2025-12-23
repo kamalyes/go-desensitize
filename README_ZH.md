@@ -48,6 +48,7 @@
 | **`MaskerConfig.SensitiveKeys` 只追加** | 内置规则表始终生效 | 无法通过配置把 `password` 配成不敏感——不允许意外收窄安全基线 |
 | 报文上限 = 10KB | 超限先截断再脱敏 | 截断后多半已非合法 JSON，会落到文本路径；需要完整处理用 `WithMaxBodySize(n)` |
 | 字段名判定 = 两档 | 日志用严格档、报文用宽松档 | 选错会既误擦又漏擦，分工见下表 |
+| **会话与令牌默认整体擦除** | `session_id`、`token`、`cookie`、`authorization` 看不到 | 它们是可重放的凭据；需要跨行关联或事故定位时用 `OverrideKeyAction` 调成指纹或加密，而不是改成明文 |
 | **Model 不走字段名启发式** | 只认 `desensitize` tag | 规则表是按日志调的，`name`、`status_code` 这些取舍对 Model 是错的 |
 | 掩码不可逆 | `Desensitize` 系列丢弃被掩字符 | 需要还原的字段用 `cipher` tag，不要指望从掩码恢复 |
 | **`BankCard` 不幂等** | 每遍插入分组空格并重新补位，越跑越长 | 12 个类型里只有它不幂等；中间件与仓储层各脱一次会产出越来越长的垃圾，要自己保证只脱一次 |
@@ -170,6 +171,45 @@ plain, err := desensitize.DefaultCipher().Decrypt(order.Receiver) // "张三丰"
 
 > ⚠️ **本库不提供默认密钥**，两种「默认」都比没有更危险：写死一个等于没加密，拿到源码的人都能解开；启动时随机生成则进程重启就换钥匙，上次写进数据库的值再也解不开
 > 未装配密钥时使用 `cipher` tag，字段会被**整体擦除**而不是留下明文——忘记装配的后果应当是「看不到数据」，而不是「以为加密了其实是明文」
+
+### 会话与令牌：关联、定位、泄漏三者的取舍
+
+`session_id`、`token`、`cookie`、`authorization` 默认**整体擦除**，这是有意的：
+它们是可重放的凭据，日志会被集中收集、很多人能读、保留数月，
+任何看得到的人复制走就能冒用该用户直到过期，而且没有审计痕迹
+
+但运维上有两个真实需求：**把一个登录会话的请求跨行串起来**，以及**出事时定位到底是谁**
+为此提供两档中间选项，用 `OverrideKeyAction` 按字段选：
+
+| 做法 | 跨行关联 | 出事定位身份 | 需要密钥 | 泄漏风险 |
+|------|:--------:|:------------:|:--------:|----------|
+| `KeepAsIs`（明文） | ✅ | ✅ | 否 | **凭据可重放** |
+| `WipeValue`（默认） | ❌ | ❌ | 否 | 无 |
+| `MaskFingerprint` | ✅ | ❌ | 否 | 仅泄漏「两值相等」 |
+| `MaskEncrypt` | ✅ | ✅ | 是 | 仅泄漏「两值相等」 |
+
+```go
+// 只要能把一个会话的请求串起来，不需要密钥
+desensitize.OverrideKeyAction("session_id", desensitize.MaskFingerprint)
+// {"session_id":"***6a9f3e7a","trace_id":"t-xyz","user_id":"u-1001"}
+// 同一会话每行都是 ***6a9f3e7a，但无法还原也无法重放
+
+// 还要能在事故复盘时还原出是哪个会话
+desensitize.SetDefaultCipher(key)
+desensitize.OverrideKeyAction("session_id", desensitize.MaskEncrypt)
+// {"session_id":"enc:v1:lFDr0e-L0k777_lQwKkRY8DPwvQek601DxXD10...","trace_id":"t-xyz"}
+
+plain, _ := desensitize.DefaultCipher().Decrypt(sealed) // "sess-abc123def456"
+```
+
+`MaskEncrypt` 走的是**确定性加密**（nonce 由明文经 HMAC 派生，SIV 构造），
+所以同一会话在所有日志行里是同一串密文——若用随机 nonce，身份能还原但关联就断了
+
+三点要知道：
+
+- 两档都**必然**泄漏「两个字段的值相等」，这正是可关联的前提；连相等关系都不能暴露时只能 `WipeValue`
+- `MaskEncrypt` 未装配密钥时字段**整体擦除**而非退回明文：你要的是「可还原」不是「可见」，配置出错不该静默泄漏
+- 很多时候根本不需要动它们——`user_id`、`trace_id`、`request_id`、`span_id`、`device_id` 默认就是明文，「追一个用户的请求链」用它们就够了
 
 ### 报文脱敏
 
@@ -369,6 +409,9 @@ go-desensitize/
 | `ActionForKeyLoose(key) KeyAction` | 宽松档：再加字段名内部词根，零分配 |
 | `IsCredentialKey(key) bool` | 是否为需整体擦除的凭据 |
 | `RegisterSensitiveKeys(keys...)` | 追加自定义敏感字段名，全进程生效 |
+| `OverrideKeyAction(key, action)` | 覆盖某字段名的判定，用于把会话类字段调成指纹或加密 |
+| `AppendFingerprint(buf, s) []byte` | 指纹掩码追加器，稳定不可逆，零分配 |
+| `FingerprintString(s) string` | 指纹掩码的字符串形态 |
 | `AppendMaskedPhone(buf, s) []byte` | 号码掩码追加器，写入既有缓冲时零分配 |
 | `AppendMaskedEmail(buf, s) []byte` | 邮箱掩码追加器，同上 |
 
@@ -380,6 +423,7 @@ go-desensitize/
 | `(*DataMasker).Mask(body) string` | 整段脱敏，JSON 走结构化、其余走单趟文本扫描 |
 | `SetDefaultCipher(key) error` | 启动阶段装配全局密钥，之后 `desensitize:"cipher"` 直接可用 |
 | `(*Cipher).Encrypt / Decrypt` | 带标识的加解密，密文被改动即报错 |
+| `(*Cipher).EncryptDeterministic(s) string` | 确定性加密，同一明文恒产出同一密文，可跨行关联 |
 | `(*Cipher).EncryptStruct / DecryptStruct` | 结构体整体加解密，解密只认标识不需清单 |
 | `IsEncrypted(v) bool` | 是否带本库的加密标识，无需密钥 |
 

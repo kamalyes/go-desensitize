@@ -14,6 +14,7 @@ package desensitize
 import (
 	"crypto/cipher"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -498,4 +499,168 @@ func TestEncryptDecryptStructDefault(t *testing.T) {
 func TestUnconfiguredCipher_Desensitize(t *testing.T) {
 	assert.Equal(t, RedactedText, unconfiguredCipher{}.Desensitize("anything"))
 	assert.Equal(t, RedactedText, unconfiguredCipher{}.Desensitize(""))
+}
+
+// ==== 确定性加密 | Deterministic encryption ====
+
+// TestCipher_Deterministic 同一明文恒产出同一密文，且仍可解回
+//
+// 这是「既要跨行关联、又要出事能定位身份」的解：
+// 随机 nonce 的 Encrypt 让同一会话每行密文都不同，关联断了
+func TestCipher_Deterministic(t *testing.T) {
+	c, err := NewCipher(testKey)
+	require.NoError(t, err)
+
+	const sess = "sess-abc123def456"
+	a := c.EncryptDeterministic(sess)
+	b := c.EncryptDeterministic(sess)
+
+	assert.Equal(t, a, b, "确定性加密必须恒产出同一串，否则无法跨行关联")
+	assert.True(t, IsEncrypted(a))
+	assert.NotContains(t, a, sess)
+
+	// 仍可解回，这是它与指纹的关键差别
+	back, err := c.Decrypt(a)
+	require.NoError(t, err)
+	assert.Equal(t, sess, back, "持密钥必须能还原出身份")
+
+	// 不同明文产出不同密文
+	assert.NotEqual(t, a, c.EncryptDeterministic("sess-other"))
+
+	// 与随机 nonce 的 Encrypt 产出不同，但两者都能被同一个 Decrypt 解开
+	rnd, err := c.Encrypt(sess)
+	require.NoError(t, err)
+	assert.NotEqual(t, a, rnd, "两种模式的密文不应相同")
+	backRnd, err := c.Decrypt(rnd)
+	require.NoError(t, err)
+	assert.Equal(t, sess, backRnd, "Decrypt 不需要区分两种模式")
+
+	// 空值原样返回
+	assert.Equal(t, "", c.EncryptDeterministic(""))
+}
+
+// TestCipher_DeterministicDifferentKeys 换密钥后密文不同且解不开
+func TestCipher_DeterministicDifferentKeys(t *testing.T) {
+	c1, err := NewCipher(testKey)
+	require.NoError(t, err)
+	c2, err := NewCipher([]byte("ffffffffffffffffffffffffffffffff"))
+	require.NoError(t, err)
+
+	const sess = "sess-abc123"
+	a := c1.EncryptDeterministic(sess)
+	b := c2.EncryptDeterministic(sess)
+	assert.NotEqual(t, a, b, "不同密钥的 nonce 派生子密钥不同，密文须不同")
+
+	_, err = c2.Decrypt(a)
+	assert.ErrorIs(t, err, ErrCipherCorrupt)
+}
+
+// TestCipher_DeterministicNonceIsolated nonce 派生用的是独立子密钥
+//
+// 同一把密钥既做加密又做 MAC 属于跨原语复用，应当避免
+// 这里间接验证：派生子密钥与原密钥不同
+func TestCipher_DeterministicNonceIsolated(t *testing.T) {
+	c, err := NewCipher(testKey)
+	require.NoError(t, err)
+	assert.NotEqual(t, testKey, c.macKey, "nonce 派生必须用独立子密钥")
+	assert.Len(t, c.macKey, 32, "HMAC-SHA256 派生结果为 32 字节")
+}
+
+// TestMaskEncrypt_FailsClosedWithoutKey MaskEncrypt 未装配密钥时整体擦除
+//
+// 调用方选 MaskEncrypt 要的是「可还原」而非「可见」，
+// 密钥没装配好时退回明文等于把本该保护的凭据原样写出去
+func TestMaskEncrypt_FailsClosedWithoutKey(t *testing.T) {
+	ClearDefaultCipher()
+	t.Cleanup(func() {
+		ClearDefaultCipher()
+		OverrideKeyAction("session_id", WipeValue)
+	})
+	OverrideKeyAction("session_id", MaskEncrypt)
+
+	m := NewMasker()
+	out := m.Mask([]byte(`{"session_id":"sess-abc123","user":"bob"}`))
+	assert.NotContains(t, out, "sess-abc123", "未装配密钥时不得留下明文")
+	assert.Contains(t, out, defaultSensitiveMask)
+	assert.Contains(t, out, "bob", "无关字段不受影响")
+
+	// 装配密钥后同一会话在多次调用里产出同一串，并可解回
+	require.NoError(t, SetDefaultCipher(testKey))
+	first := m.Mask([]byte(`{"session_id":"sess-abc123"}`))
+	second := m.Mask([]byte(`{"session_id":"sess-abc123"}`))
+	assert.Equal(t, first, second, "确定性加密让同一会话跨行可关联")
+	assert.NotContains(t, first, "sess-abc123")
+
+	var d map[string]any
+	require.NoError(t, json.Unmarshal([]byte(first), &d))
+	back, err := DefaultCipher().Decrypt(d["session_id"].(string))
+	require.NoError(t, err)
+	assert.Equal(t, "sess-abc123", back, "事故复盘时持密钥可还原身份")
+
+	// 文本路径同样走加密分支，且同样确定性、同样可还原
+	txt := m.Mask([]byte("session_id=sess-abc123 user=bob"))
+	assert.NotContains(t, txt, "sess-abc123")
+	assert.Contains(t, txt, "user=bob", "无关字段不受影响")
+	assert.Equal(t, txt, m.Mask([]byte("session_id=sess-abc123 user=bob")),
+		"文本路径同样确定性，同一会话跨行可关联")
+
+	sealed := strings.TrimSuffix(strings.TrimPrefix(txt, "session_id="), " user=bob")
+	require.True(t, IsEncrypted(sealed), "文本路径应产出带标识的密文，实得 %q", sealed)
+	back, err = DefaultCipher().Decrypt(sealed)
+	require.NoError(t, err)
+	assert.Equal(t, "sess-abc123", back)
+
+	// 未装配密钥时文本路径同样失败关闭
+	ClearDefaultCipher()
+	txt = m.Mask([]byte("session_id=sess-abc123 user=bob"))
+	assert.NotContains(t, txt, "sess-abc123", "未装配密钥时文本路径不得留明文")
+	assert.Contains(t, txt, defaultSensitiveMask)
+}
+
+// TestMaskFingerprint_InMasker 指纹档在报文脱敏里生效且不需要密钥
+func TestMaskFingerprint_InMasker(t *testing.T) {
+	t.Cleanup(func() { OverrideKeyAction("session_id", WipeValue) })
+	OverrideKeyAction("session_id", MaskFingerprint)
+
+	m := NewMasker()
+	a := m.Mask([]byte(`{"session_id":"sess-abc123","user":"bob"}`))
+	b := m.Mask([]byte(`{"session_id":"sess-abc123","user":"amy"}`))
+
+	var da, db map[string]any
+	require.NoError(t, json.Unmarshal([]byte(a), &da))
+	require.NoError(t, json.Unmarshal([]byte(b), &db))
+
+	assert.Equal(t, da["session_id"], db["session_id"], "同一会话指纹一致，可关联")
+	assert.NotContains(t, a, "sess-abc123")
+	assert.Equal(t, "bob", da["user"])
+
+	// 不同会话指纹不同
+	cOut := m.Mask([]byte(`{"session_id":"sess-other"}`))
+	var dc map[string]any
+	require.NoError(t, json.Unmarshal([]byte(cOut), &dc))
+	assert.NotEqual(t, da["session_id"], dc["session_id"])
+
+	// 文本路径同样生效
+	txt := m.Mask([]byte("session_id=sess-abc123 user=bob"))
+	assert.NotContains(t, txt, "sess-abc123")
+	assert.Contains(t, txt, "user=bob")
+	assert.Equal(t, txt, m.Mask([]byte("session_id=sess-abc123 user=bob")), "文本路径同样确定性")
+}
+
+// TestMaskEncrypt_NonStringValue 非字符串值没有安全的加密方式，整体擦除
+func TestMaskEncrypt_NonStringValue(t *testing.T) {
+	ClearDefaultCipher()
+	require.NoError(t, SetDefaultCipher(testKey))
+	t.Cleanup(func() {
+		ClearDefaultCipher()
+		OverrideKeyAction("session_id", WipeValue)
+	})
+	OverrideKeyAction("session_id", MaskEncrypt)
+
+	m := NewMasker()
+	out := m.Mask([]byte(`{"session_id":12345}`))
+	var d map[string]any
+	require.NoError(t, json.Unmarshal([]byte(out), &d))
+	assert.Equal(t, defaultSensitiveMask, d["session_id"])
+	assert.NotContains(t, out, "12345")
 }

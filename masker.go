@@ -168,6 +168,10 @@ func (dm *DataMasker) maskJSONFields(data any) any {
 				v[key] = maskTextValue(value, MaskPhoneString, dm.getMask())
 			case MaskEmail:
 				v[key] = maskTextValue(value, MaskEmailString, dm.getMask())
+			case MaskFingerprint:
+				v[key] = maskTextValue(value, FingerprintString, dm.getMask())
+			case MaskEncrypt:
+				v[key] = maskTextValue(value, dm.encryptValue, dm.getMask())
 			default:
 				v[key] = dm.maskJSONFields(value)
 			}
@@ -241,6 +245,10 @@ func (dm *DataMasker) maskText(s string) string {
 			b.WriteString(MaskPhoneString(s[valStart:valEnd]))
 		case MaskEmail:
 			b.WriteString(MaskEmailString(s[valStart:valEnd]))
+		case MaskFingerprint:
+			b.WriteString(FingerprintString(s[valStart:valEnd]))
+		case MaskEncrypt:
+			b.WriteString(dm.encryptValue(s[valStart:valEnd]))
 		default:
 			b.WriteString(dm.getMask())
 		}
@@ -351,6 +359,24 @@ func isValueEnd(c byte, colonStyle bool) bool {
 		return !colonStyle
 	}
 	return false
+}
+
+// encryptValue 用全局可逆脱敏器加密字段值，未装配密钥时整体擦除
+//
+// 失败关闭：MaskEncrypt 是调用方通过 OverrideKeyAction 显式选的，
+// 若密钥没装配好而退回明文，等于把本该保护的凭据原样写出去——
+// 宁可看不到数据，也不能在配置出错时静默泄漏
+//
+// [EN] Fails closed: MaskEncrypt is an explicit opt-in via OverrideKeyAction,
+// so falling back to plaintext when the key is missing would write out exactly
+// the credential the caller asked to protect
+func (dm *DataMasker) encryptValue(v string) string {
+	c := DefaultCipher()
+	if c == nil {
+		return dm.getMask()
+	}
+	// 用确定性加密：日志场景需要同一会话在所有行里是同一串，否则关联能力就没了
+	return c.EncryptDeterministic(v)
 }
 
 // ==== 判定与配置 | Decision and config ====

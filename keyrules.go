@@ -30,7 +30,11 @@
 
 package desensitize
 
-import "strings"
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"strings"
+)
 
 // RedactedText 敏感值的替换文本
 const RedactedText = "[REDACTED]"
@@ -39,10 +43,12 @@ const RedactedText = "[REDACTED]"
 type KeyAction uint8
 
 const (
-	KeepAsIs  KeyAction = iota // 不处理
-	WipeValue                  // 整体替换为 RedactedText
-	MaskPhone                  // 号码掩码（保留末 4 位）
-	MaskEmail                  // 邮箱掩码（保留首字符与域名）
+	KeepAsIs        KeyAction = iota // 不处理
+	WipeValue                        // 整体替换为 RedactedText
+	MaskPhone                        // 号码掩码（保留末 4 位）
+	MaskEmail                        // 邮箱掩码（保留首字符与域名）
+	MaskFingerprint                  // 指纹掩码：稳定、不可逆、可跨行关联
+	MaskEncrypt                      // 确定性加密：稳定、可关联，持密钥可还原身份
 )
 
 // exactKeyRules 字段名 → 动作 的精确规则表，键为归一化形态（去 _-. 并转小写）
@@ -436,6 +442,102 @@ func ActionForKey(key string) KeyAction {
 // IsCredentialKey 报告字段名是否为需整体擦除的凭据（供 URL 查询参数判定复用）
 func IsCredentialKey(key string) bool {
 	return ActionForKey(key) == WipeValue
+}
+
+// ==== 指纹与可还原掩码 | Fingerprint and recoverable masking ====
+//
+// session_id、token 这类字段有两个互相拉扯的运维需求：
+//
+//  1. 跨行关联 —— 把同一个登录会话的请求串起来
+//  2. 出事定位 —— 事故复盘时知道到底是哪个会话、哪个用户
+//
+// 直接明文两个都满足，但等于把可重放的凭据投放到日志系统：
+// 日志被集中收集、很多人能读、保留数月，任何看得到的人复制走就能冒用该用户
+// 直到过期，而且没有审计痕迹
+// 整体擦除没有泄漏风险，但两个需求都落空
+//
+// 因此提供两档中间选项：
+//
+//	MaskFingerprint   ***a1b2c3d4     可关联，不可还原，不需要密钥
+//	MaskEncrypt       enc:v1:<base64> 可关联，持密钥可还原，需先装配密钥
+//
+// 两者都会泄漏「两个字段的值相等」这一事实 —— 这正是它们可用于关联的前提
+// 若连相等关系都不能暴露，只能用 WipeValue
+//
+// [EN] Session-like fields pull in two directions: correlating a login's
+// requests across log lines, and identifying which session it actually was
+// during an incident review. Plaintext serves both but drops a replayable
+// credential into a centrally collected, widely read, long-retained system.
+// Wiping is safe but serves neither. Hence two middle options: a fingerprint
+// that correlates without being invertible, and deterministic encryption that
+// correlates and can be resolved by a key holder. Both reveal that two values
+// are equal, which is what makes them correlatable; use WipeValue when even
+// that must not be exposed
+
+// fingerprintHexLen 指纹的十六进制字符数
+//
+// 8 个十六进制字符即 32 位，约 43 亿种取值
+// 同一时段的活跃会话量远低于生日界限，足以区分；又短到不撑长日志，
+// 也不足以用于离线穷举还原原值
+// [EN] Eight hex characters give 32 bits: plenty to tell concurrent sessions
+// apart, short enough not to bloat a log line, far too little to invert
+const fingerprintHexLen = 8
+
+// AppendFingerprint 追加指纹掩码："***" + 原值 SHA-256 的前若干位十六进制
+// 同一输入恒产出同一串，因此可跨行关联；拿到指纹的人无法还原也无法重放
+func AppendFingerprint(buf []byte, s string) []byte {
+	if s == "" {
+		return append(buf, RedactedText...)
+	}
+	sum := sha256.Sum256([]byte(s))
+	var hexBuf [fingerprintHexLen]byte
+	hex.Encode(hexBuf[:], sum[:fingerprintHexLen/2])
+	buf = append(buf, '*', '*', '*')
+	return append(buf, hexBuf[:]...)
+}
+
+// FingerprintString 指纹掩码的字符串形态
+func FingerprintString(s string) string {
+	return string(AppendFingerprint(make([]byte, 0, len(RedactedText)+fingerprintHexLen+3), s))
+}
+
+// ==== 判定覆盖 | Decision overrides ====
+
+// OverrideKeyAction 覆盖某个字段名的判定结果，全进程生效
+//
+// 应在启动阶段调用完毕，规则表在判定路径上只读
+// 字段名按归一化形态存入，因此 session_id、sessionId、SESSION-ID 一并生效
+//
+// 典型用法是把会话类字段从「整体擦除」调成可关联的形态：
+//
+//	// 只要能把一个会话的请求串起来
+//	desensitize.OverrideKeyAction("session_id", desensitize.MaskFingerprint)
+//	// 还要能在事故复盘时还原出是哪个会话
+//	desensitize.SetDefaultCipher(key)
+//	desensitize.OverrideKeyAction("session_id", desensitize.MaskEncrypt)
+//
+// 也可以调成 KeepAsIs 让字段明文，但那意味着把可重放的凭据写进日志，
+// 请确认日志的可见范围与留存期之后再这么做
+//
+// 相比专门给 session 开一个开关，通用覆盖更可取：
+// 同一个机制能应付日后任何字段的取舍变化，不必为每类字段各加一个配置项
+//
+// [EN] Overrides one key's decision process-wide; do it at startup. Keys are
+// stored normalised, so session_id, sessionId and SESSION-ID are all covered.
+// KeepAsIs is available but means writing a replayable credential into the log,
+// so weigh the log's audience and retention first. A general override beats a
+// bespoke session switch: one mechanism covers any future field
+func OverrideKeyAction(key string, action KeyAction) {
+	var buf [maxNormalizedKeyLen]byte
+	n, ok := normalizeKeyInto(buf[:], key)
+	if !ok || n == 0 {
+		return
+	}
+	normalized := string(buf[:n])
+	exactKeyRules[normalized] = action
+	// 形状位图必须同步：ActionForKey 以它为前置过滤，
+	// 漏更新会让覆盖永远查不到精确表
+	markKeyShape(normalized[0], normalized[n-1], n)
 }
 
 // AppendMaskedPhone 追加号码掩码："***" + 末 4 位数字；数字不足 5 位时整体擦除

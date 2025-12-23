@@ -29,7 +29,9 @@ package desensitize
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"io"
@@ -187,6 +189,8 @@ func init() {
 // cost is that ciphertexts cannot be compared or deduplicated
 type Cipher struct {
 	aead cipher.AEAD
+	// macKey 确定性模式派生 nonce 用的独立密钥，见 EncryptDeterministic
+	macKey []byte
 	// randRead 随机源，以字段形式存在以便测试注入失败
 	randRead func([]byte) (int, error)
 }
@@ -211,8 +215,19 @@ func NewCipher(key []byte) (*Cipher, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 确定性模式的 nonce 由 HMAC 派生，其密钥必须与加密密钥分开
+	// 同一把密钥既做加密又做 MAC 是跨原语复用，属于应当避免的用法
+	// 这里用带标签的 HMAC 派生一把独立子密钥，标签含版本以便日后更换构造
+	// [EN] The deterministic nonce is HMAC-derived, and that HMAC key must be
+	// separate from the encryption key: using one key across two primitives is
+	// the kind of reuse to avoid. A labelled HMAC derives an independent
+	// subkey, with the label versioned so the construction can change later
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte("go-desensitize/siv/v1"))
+
 	return &Cipher{
 		aead:     aead,
+		macKey:   mac.Sum(nil),
 		randRead: func(b []byte) (int, error) { return io.ReadFull(rand.Reader, b) },
 	}, nil
 }
@@ -249,6 +264,47 @@ func (c *Cipher) Encrypt(plain string) (string, error) {
 	// nonce 前置在密文之前，Decrypt 据此切分
 	sealed := c.aead.Seal(nonce, nonce, []byte(plain), nil)
 	return cipherMarker + base64.RawURLEncoding.EncodeToString(sealed), nil
+}
+
+// EncryptDeterministic 确定性加密：同一明文恒产出同一密文
+//
+// 解决「既要跨行关联、又要出事能定位身份」这对需求：
+// 随机 nonce 的 Encrypt 让同一 session_id 每次密文都不同，身份能还原但关联断了；
+// 这里把 nonce 由明文确定性派生（SIV 构造），于是同一会话在所有日志行里
+// 都是同一串密文，既能串起来，持密钥的人又能解出到底是哪个会话
+//
+// nonce = HMAC-SHA256(独立派生的子密钥, 明文) 截断到 GCM 的 nonce 长度
+// 确定性意味着**必然**泄漏「两个字段的值相等」，这正是可关联的前提；
+// 若连相等关系都不能暴露，请用 Encrypt 或整体擦除
+//
+// 密文格式与 Encrypt 完全一致，因此 Decrypt 不需要区分两者
+//
+// [EN] Resolves the tension between correlating across log lines and being
+// able to identify the session during an incident: the random-nonce Encrypt
+// yields a different ciphertext every time, so identity survives but
+// correlation does not. Here the nonce is derived from the plaintext (an SIV
+// construction), so one session is one ciphertext everywhere while a key holder
+// can still resolve it. Determinism necessarily reveals that two values are
+// equal — the very property that makes it correlatable; use Encrypt or wiping
+// when even that must not leak. The output format matches Encrypt, so Decrypt
+// needs no distinction
+// 不返回 error：nonce 由明文经 HMAC 派生，不消耗随机数，
+// 因此与 Encrypt 不同，这条路没有任何可失败的环节
+// 给它配一个永远为 nil 的 error 只会让调用方写出永不执行的分支
+// [EN] No error return: the nonce is HMAC-derived from the plaintext and
+// consumes no randomness, so unlike Encrypt nothing here can fail. An error
+// that is always nil would only make callers write a branch that never runs
+func (c *Cipher) EncryptDeterministic(plain string) string {
+	if plain == "" {
+		return ""
+	}
+
+	mac := hmac.New(sha256.New, c.macKey)
+	mac.Write([]byte(plain))
+	nonce := mac.Sum(nil)[:c.aead.NonceSize()]
+
+	sealed := c.aead.Seal(nonce[:len(nonce):len(nonce)], nonce, []byte(plain), nil)
+	return cipherMarker + base64.RawURLEncoding.EncodeToString(sealed)
 }
 
 // MustEncrypt 加密明文，失败时回落为整体擦除

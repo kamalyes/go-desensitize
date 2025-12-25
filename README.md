@@ -275,6 +275,27 @@ masker.Mask([]byte("ts=2025-12-23 token=abc123 user=bob level=info"))
 
 > ⚠️ When a field name itself matches, the **whole container** is wiped to a single string rather than descended into: an object called `credentials` disappears entirely, taking any `publicKey` inside it along. Do not name a container after a sensitive root
 
+### Decryption console
+
+During an incident review you have a log line containing `enc:v1:...` and need the original
+value back. The repository ships an offline, single-file tool for that:
+[tools/decrypt.html](tools/decrypt.html)
+
+Open it locally in a browser, paste the key and the whole log line, and it finds every
+ciphertext in the text and resolves each one. It also verifies fingerprints in reverse: a
+fingerprint cannot be inverted, but you can supply candidate values and see which one matches
+
+```bash
+open tools/decrypt.html          # macOS
+xdg-open tools/decrypt.html      # Linux
+```
+
+> ⚠️ **Open it from local `file://` only; do not deploy it**
+> Hosting it with a key embedded hands a decryption oracle to everyone who can reach it, which
+> is worse than plaintext in the log — plaintext at least requires getting the log first
+> The file pulls in no external resource, makes no network request and persists no key; all
+> crypto goes through the browser's own WebCrypto
+
 ### Field-name heuristics
 
 When the schema is not yours (log key-value pairs, arbitrary JSON from upstream), guess from the field name, at two strengths:
@@ -375,7 +396,8 @@ go-desensitize/
 ├── cipher.go         # reversible masking: AES-GCM, version marker, global key configuration
 ├── strutil.go        # internal dependency-free string helpers (including upstream index quirks)
 ├── *_test.go         # one test file per source file, 100% statement coverage
-└── bench_test.go     # permanent benchmarks across four layers, with parallel counterparts
+├── bench_test.go     # permanent benchmarks across four layers, with parallel counterparts
+└── tools/decrypt.html # offline decryption console: resolves enc:v1: and verifies fingerprints
 ```
 
 ## 🧰 Module map

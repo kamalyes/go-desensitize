@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>go-desensitize 解密调试台</title>
+<!--
+  离线单文件工具，用于事故复盘时把日志里的 enc:v1: 密文解回原文
+
+  设计前提是「绝不部署」：
+    - 不引入任何外部资源，没有 CDN、没有字体、没有网络请求
+    - 密钥由使用者粘贴，不写 localStorage、不写 cookie、不出浏览器
+    - 全部密码学运算走浏览器自带的 WebCrypto
+
+  为什么强调这一点：带着密钥部署成一个网页，等于给所有能访问它的人开了一个
+  解密预言机，比日志里直接存明文更糟 —— 明文至少还需要先拿到日志
+  这个文件只该从本地 file:// 打开
+
+  [EN] An offline, single-file tool for resolving enc:v1: ciphertexts during an
+  incident review. It is built on the premise that it is never deployed: no
+  external resource of any kind, the key is pasted and never persisted, and all
+  crypto goes through the browser's own WebCrypto. Hosting this with a key
+  embedded would hand a decryption oracle to everyone who can reach it, which is
+  worse than plaintext in the log. Open it from file:// only
+-->
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel-2: #1d2129;
+    --line: #2a2f3a;
+    --fg: #e6e8ec;
+    --fg-dim: #9aa2b1;
+    --accent: #5aa9e6;
+    --ok: #4ec9a7;
+    --warn: #e3b341;
+    --err: #e5706b;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f7f9; --panel: #fff; --panel-2: #f0f2f5; --line: #dfe3e8;
+      --fg: #1d2129; --fg-dim: #5c6472; --accent: #1668b8;
+      --ok: #1a7f5f; --warn: #8a6100; --err: #b4342e;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 20px 64px;
+    background: var(--bg); color: var(--fg);
+    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+      "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  }
+  .wrap { max-width: 920px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .sub { color: var(--fg-dim); font-size: 14px; margin: 0 0 24px; }
+  .banner {
+    border: 1px solid var(--warn); border-left-width: 3px; border-radius: 6px;
+    background: color-mix(in srgb, var(--warn) 10%, transparent);
+    padding: 12px 14px; margin: 0 0 24px; font-size: 13.5px;
+  }
+  .banner b { color: var(--warn); }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 18px; margin: 0 0 18px;
+  }
+  .panel h2 {
+    font-size: 15px; margin: 0 0 4px; display: flex; align-items: center; gap: 8px;
+  }
+  .panel h2 .tag {
+    font: 11px/1 var(--mono); color: var(--fg-dim);
+    border: 1px solid var(--line); border-radius: 4px; padding: 4px 6px;
+  }
+  .panel .hint { color: var(--fg-dim); font-size: 13px; margin: 0 0 14px; }
+  label { display: block; font-size: 13px; color: var(--fg-dim); margin: 0 0 6px; }
+  input[type=text], textarea {
+    width: 100%; background: var(--panel-2); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 6px;
+    padding: 10px 12px; font: 13px/1.5 var(--mono); resize: vertical;
+  }
+  input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .row { margin: 0 0 14px; }
+  button {
+    background: var(--accent); color: #fff; border: 0; border-radius: 6px;
+    padding: 9px 16px; font-size: 14px; font-weight: 500; cursor: pointer;
+  }
+  button:hover { filter: brightness(1.08); }
+  button.ghost { background: transparent; color: var(--fg-dim); border: 1px solid var(--line); }
+  .btns { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .out {
+    margin: 14px 0 0; padding: 12px; border-radius: 6px;
+    background: var(--panel-2); border: 1px solid var(--line);
+    font: 13px/1.6 var(--mono); white-space: pre-wrap; word-break: break-all;
+    min-height: 44px;
+  }
+  .out:empty { display: none; }
+  .ok { color: var(--ok); }
+  .err { color: var(--err); }
+  .dim { color: var(--fg-dim); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 10px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); }
+  th { color: var(--fg-dim); font-weight: 500; }
+  td.mono { font-family: var(--mono); word-break: break-all; }
+  footer { color: var(--fg-dim); font-size: 12.5px; margin-top: 28px; }
+  code { font-family: var(--mono); font-size: 0.92em; background: var(--panel-2);
+         padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>go-desensitize 解密调试台</h1>
+  <p class="sub">把日志里的 <code>enc:v1:</code> 密文解回原文，或核对 <code>***xxxxxxxx</code> 指纹对应哪个值</p>
+
+  <div class="banner">
+    <b>只从本地 file:// 打开，不要部署</b><br>
+    带着密钥部署成网页，等于给所有能访问它的人开了一个解密预言机，比日志里直接存明文更糟
+    本页不引入任何外部资源、不发网络请求、不保存密钥，全部运算走浏览器自带的 WebCrypto
+  </div>
+
+  <div class="panel">
+    <h2>密钥 <span class="tag">AES-128 / 192 / 256</span></h2>
+    <p class="hint">与 <code>SetDefaultCipher</code> 用的同一把密钥，支持 base64 或 hex，自动识别</p>
+    <div class="row">
+      <label for="key">密钥</label>
+      <input type="text" id="key" spellcheck="false" autocomplete="off"
+             placeholder="MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=  或  3031...6566">
+    </div>
+    <div id="keyInfo" class="dim" style="font-size:13px"></div>
+  </div>
+
+  <div class="panel">
+    <h2>解密 <span class="tag">enc:v1:</span></h2>
+    <p class="hint">可以整段粘贴日志行，会自动找出其中所有密文逐个解开</p>
+    <div class="row">
+      <label for="cipher">日志行或密文</label>
+      <textarea id="cipher" rows="5" spellcheck="false"
+                placeholder='{"level":"info","session_id":"enc:v1:lFDr0e-L0k777_lQwKkRY8DPwvQek601DxXD10M0BZBhwO_c-3VUpGowfZ1J","user_id":"u-1001"}'></textarea>
+    </div>
+    <div class="btns">
+      <button id="btnDec">解密</button>
+      <button class="ghost" id="btnClear">清空</button>
+    </div>
+    <div class="out" id="outDec"></div>
+  </div>
+
+  <div class="panel">
+    <h2>指纹核对 <span class="tag">***xxxxxxxx</span></h2>
+    <p class="hint">
+      指纹不可逆，无法「解出」原值
+      但可以反向验证：给出候选原值，看它的指纹是否与日志里那串一致
+      不需要密钥
+    </p>
+    <div class="row">
+      <label for="fp">日志里的指纹</label>
+      <input type="text" id="fp" spellcheck="false" autocomplete="off" placeholder="***6a9f3e7a">
+    </div>
+    <div class="row">
+      <label for="cands">候选原值（每行一个）</label>
+      <textarea id="cands" rows="4" spellcheck="false" placeholder="sess-abc123def456&#10;sess-other&#10;sess-third"></textarea>
+    </div>
+    <div class="btns">
+      <button id="btnFp">核对</button>
+    </div>
+    <div id="outFp"></div>
+  </div>
+
+  <footer>
+    密文格式：<code>enc:v1:</code> + base64url(nonce[12] ‖ 密文 ‖ tag[16])，AES-GCM<br>
+    指纹格式：<code>***</code> + SHA-256(原值) 前 4 字节的十六进制<br>
+    两者的生成端见仓库的 <code>cipher.go</code> 与 <code>keyrules.go</code>
+  </footer>
+
+</div>
+
+<script>
+'use strict';
+
+const $ = (id) => document.getElementById(id);
+const te = new TextEncoder();
+const td = new TextDecoder();
+const MARKER = 'enc:v1:';
+
+// WebCrypto 在 file:// 下属于安全上下文，但部分浏览器仍可能禁用，先探测
+if (!globalThis.crypto || !globalThis.crypto.subtle) {
+  document.querySelector('.banner').innerHTML =
+    '<b>当前环境没有 WebCrypto</b><br>请用 Chrome、Edge、Firefox 或 Safari 的较新版本从 file:// 打开本文件';
+}
+
+// ---- 编码辅助 ----
+
+// base64url 与标准 base64 都接受，补齐 padding 后解码
+function b64ToBytes(s) {
+  s = s.trim().replace(/-/g, '+').replace(/_/g, '/');
+  while (s.length % 4) s += '=';
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function hexToBytes(s) {
+  s = s.trim().replace(/[\s:]/g, '');
+  const out = new Uint8Array(s.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(s.substr(i * 2, 2), 16);
+  return out;
+}
+
+function bytesToHex(b) {
+  return [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
+}
+
+// parseKey 自动识别 hex 与 base64
+// 纯十六进制且长度为 32/48/64 字符时按 hex 处理，其余按 base64
+function parseKey(raw) {
+  const s = raw.trim();
+  if (!s) throw new Error('请先填入密钥');
+  if (/^[0-9a-fA-F\s:]+$/.test(s)) {
+    const compact = s.replace(/[\s:]/g, '');
+    if ([32, 48, 64].includes(compact.length)) return hexToBytes(compact);
+  }
+  const bytes = b64ToBytes(s);
+  if (![16, 24, 32].includes(bytes.length)) {
+    throw new Error(`密钥长度为 ${bytes.length} 字节，必须是 16、24 或 32`);
+  }
+  return bytes;
+}
+
+async function importKey(bytes) {
+  return crypto.subtle.importKey('raw', bytes, { name: 'AES-GCM' }, false, ['decrypt']);
+}
+
+// ---- 密钥面板 ----
+
+$('key').addEventListener('input', () => {
+  const info = $('keyInfo');
+  const raw = $('key').value.trim();
+  if (!raw) { info.textContent = ''; return; }
+  try {
+    const b = parseKey(raw);
+    const bits = b.length * 8;
+    info.innerHTML = `<span class="ok">✓ 识别为 AES-${bits}，${b.length} 字节</span>`;
+  } catch (e) {
+    info.innerHTML = `<span class="err">✗ ${e.message}</span>`;
+  }
+});
+
+// ---- 解密 ----
+
+// extractTokens 从任意文本里抓出所有密文
+// 以标记开头，到 base64url 字符集之外的第一个字符为止
+function extractTokens(text) {
+  const out = [];
+  let i = 0;
+  while ((i = text.indexOf(MARKER, i)) !== -1) {
+    let j = i + MARKER.length;
+    while (j < text.length && /[A-Za-z0-9\-_=]/.test(text[j])) j++;
+    if (j > i + MARKER.length) out.push(text.slice(i, j));
+    i = j;
+  }
+  return out;
+}
+
+async function decryptOne(key, token) {
+  const raw = b64ToBytes(token.slice(MARKER.length));
+  if (raw.length < 12 + 16) throw new Error('载荷过短，不足 nonce 与 tag');
+  const iv = raw.slice(0, 12);
+  const data = raw.slice(12);
+  const plain = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv, tagLength: 128 }, key, data
+  );
+  return td.decode(plain);
+}
+
+$('btnDec').addEventListener('click', async () => {
+  const out = $('outDec');
+  out.className = 'out';
+  try {
+    const key = await importKey(parseKey($('key').value));
+    const text = $('cipher').value;
+    const tokens = extractTokens(text);
+    if (!tokens.length) {
+      out.innerHTML = '<span class="dim">没有找到 enc:v1: 形态的密文</span>';
+      return;
+    }
+
+    const rows = [];
+    for (const tok of tokens) {
+      try {
+        const plain = await decryptOne(key, tok);
+        rows.push(`<tr><td class="mono dim">${esc(short(tok))}</td><td class="mono ok">${esc(plain)}</td></tr>`);
+      } catch (e) {
+        // GCM 认证失败不区分「密钥不对」与「密文被改动」，避免成为预言机
+        rows.push(`<tr><td class="mono dim">${esc(short(tok))}</td><td class="err">解不开：密钥不匹配或密文已损坏</td></tr>`);
+      }
+    }
+    out.innerHTML =
+      `<table><tr><th style="width:42%">密文</th><th>原文</th></tr>${rows.join('')}</table>`;
+  } catch (e) {
+    out.innerHTML = `<span class="err">${esc(e.message)}</span>`;
+  }
+});
+
+$('btnClear').addEventListener('click', () => {
+  $('cipher').value = '';
+  $('outDec').innerHTML = '';
+});
+
+// ---- 指纹核对 ----
+
+async function fingerprint(s) {
+  const sum = new Uint8Array(await crypto.subtle.digest('SHA-256', te.encode(s)));
+  return '***' + bytesToHex(sum.slice(0, 4));
+}
+
+$('btnFp').addEventListener('click', async () => {
+  const out = $('outFp');
+  const target = $('fp').value.trim();
+  const cands = $('cands').value.split('\n').map((x) => x.trim()).filter(Boolean);
+
+  if (!cands.length) {
+    out.innerHTML = '<div class="out"><span class="dim">请至少填入一个候选原值</span></div>';
+    return;
+  }
+
+  const rows = [];
+  let hit = false;
+  for (const c of cands) {
+    const fp = await fingerprint(c);
+    const match = target && fp.toLowerCase() === target.toLowerCase();
+    if (match) hit = true;
+    rows.push(
+      `<tr><td class="mono">${esc(c)}</td><td class="mono">${esc(fp)}</td>` +
+      `<td class="${match ? 'ok' : 'dim'}">${match ? '✓ 匹配' : target ? '不匹配' : '—'}</td></tr>`
+    );
+  }
+
+  let note = '';
+  if (target && !hit) {
+    note = '<div class="out"><span class="dim">候选里没有匹配项' +
+      '指纹不可逆，只能逐个核对候选，无法反推原值</span></div>';
+  }
+  out.innerHTML =
+    `<table><tr><th style="width:46%">候选原值</th><th>指纹</th><th style="width:88px">结果</th></tr>` +
+    `${rows.join('')}</table>${note}`;
+});
+
+// ---- 小工具 ----
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+// short 截短密文，避免表格被一长串 base64 撑爆
+function short(tok) {
+  return tok.length > 44 ? tok.slice(0, 38) + '…' + tok.slice(-4) : tok;
+}
+</script>
+</body>
+</html>

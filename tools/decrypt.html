@@ -60,6 +60,9 @@
     padding: 12px 14px; margin: 0 0 24px; font-size: 13.5px;
   }
   .banner b { color: var(--warn); }
+  .banner.demo { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent); }
+  .banner.demo b { color: var(--accent); }
+  button.tiny { padding: 4px 10px; font-size: 12.5px; vertical-align: baseline; }
   .panel {
     background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
     padding: 18px; margin: 0 0 18px;
@@ -118,13 +121,21 @@
     本页不引入任何外部资源、不发网络请求、不保存密钥，全部运算走浏览器自带的 WebCrypto
   </div>
 
+  <div class="banner demo">
+    <b>页面已填入示例数据</b>，直接点下面的「解密」与「核对」就能看到效果<br>
+    示例用的是仓库测试里的公开演示密钥 <code>0123456789abcdef0123456789abcdef</code>，
+    <b>它是公开的，绝不可用于真实数据</b>换成自己的密钥前先点
+    <button class="ghost tiny" id="btnResetAll">清空全部</button>
+  </div>
+
   <div class="panel">
     <h2>密钥 <span class="tag">AES-128 / 192 / 256</span></h2>
     <p class="hint">与 <code>SetDefaultCipher</code> 用的同一把密钥，支持 base64 或 hex，自动识别</p>
     <div class="row">
       <label for="key">密钥</label>
       <input type="text" id="key" spellcheck="false" autocomplete="off"
-             placeholder="MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=  或  3031...6566">
+             placeholder="MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=  或  3031...6566"
+             value="MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=">
     </div>
     <div id="keyInfo" class="dim" style="font-size:13px"></div>
   </div>
@@ -134,8 +145,7 @@
     <p class="hint">可以整段粘贴日志行，会自动找出其中所有密文逐个解开</p>
     <div class="row">
       <label for="cipher">日志行或密文</label>
-      <textarea id="cipher" rows="5" spellcheck="false"
-                placeholder='{"level":"info","session_id":"enc:v1:lFDr0e-L0k777_lQwKkRY8DPwvQek601DxXD10M0BZBhwO_c-3VUpGowfZ1J","user_id":"u-1001"}'></textarea>
+      <textarea id="cipher" rows="6" spellcheck="false">{"ts":"2025-12-23T19:05:22+08:00","level":"info","msg":"order paid","session_id":"enc:v1:lFDr0e-L0k777_lQwKkRY8DPwvQek601DxXD10M0BZBhwO_c-3VUpGowfZ1J","user_id":"u-1001","trace_id":"t-xyz","prev_session":"enc:v1:j4RQiTNd7XdrJvtqJ1XY49pfv8-cuKdJl1sQkBpQ6t5-Qdg0caxKgTME9NsD","amount":19900}</textarea>
     </div>
     <div class="btns">
       <button id="btnDec">解密</button>
@@ -153,11 +163,14 @@
     </p>
     <div class="row">
       <label for="fp">日志里的指纹</label>
-      <input type="text" id="fp" spellcheck="false" autocomplete="off" placeholder="***6a9f3e7a">
+      <input type="text" id="fp" spellcheck="false" autocomplete="off"
+             placeholder="***6a9f3e7a" value="***6a9f3e7a">
     </div>
     <div class="row">
       <label for="cands">候选原值（每行一个）</label>
-      <textarea id="cands" rows="4" spellcheck="false" placeholder="sess-abc123def456&#10;sess-other&#10;sess-third"></textarea>
+      <textarea id="cands" rows="4" spellcheck="false">sess-other
+sess-abc123def456
+sess-third</textarea>
     </div>
     <div class="btns">
       <button id="btnFp">核对</button>
@@ -245,6 +258,9 @@ $('key').addEventListener('input', () => {
   }
 });
 
+// 预填的密钥也要立刻走一次识别，让面板不是空的
+$('key').dispatchEvent(new Event('input'));
+
 // ---- 解密 ----
 
 // extractTokens 从任意文本里抓出所有密文
@@ -304,6 +320,14 @@ $('btnDec').addEventListener('click', async () => {
 $('btnClear').addEventListener('click', () => {
   $('cipher').value = '';
   $('outDec').innerHTML = '';
+});
+
+// 换用真实密钥前先清空示例，免得把演示密钥当成自己的那把
+$('btnResetAll').addEventListener('click', () => {
+  for (const id of ['key', 'cipher', 'fp', 'cands']) $(id).value = '';
+  for (const id of ['outDec', 'outFp', 'keyInfo']) $(id).innerHTML = '';
+  document.querySelector('.banner.demo').remove();
+  $('key').focus();
 });
 
 // ---- 指纹核对 ----

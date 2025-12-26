@@ -32,6 +32,25 @@ type DefaultDesensitizer struct {
 	desensitizerType DesensitizeType
 }
 
+// NewDefaultDesensitizer 以内置脱敏类型构造一个脱敏器
+//
+// 用于把内置类型注册到自定义的 tag 名下：
+//
+//	desensitize.RegisterDesensitizer("myType",
+//	    desensitize.NewDefaultDesensitizer(desensitize.CustomExtension))
+//
+// 没有这个构造函数时包外无路可走：DefaultDesensitizer 的字段不导出，
+// 复合字面量 &DefaultDesensitizer{CustomExtension} 在包外编译不过
+// 上游文档里一直写着那种用法，但它从来没能编译 —— 这里把这条路补通
+//
+// [EN] Wraps a built-in masking type so it can be registered under a custom tag
+// name. Without this there is no way to do it from outside the package: the
+// field is unexported, so the composite literal shown in upstream's docs never
+// actually compiled
+func NewDefaultDesensitizer(t DesensitizeType) Desensitizer {
+	return &DefaultDesensitizer{desensitizerType: t}
+}
+
 // Desensitize 按指定的脱敏类型处理输入值
 func (e *DefaultDesensitizer) Desensitize(value string) string {
 	return Desensitize(value, e.desensitizerType)

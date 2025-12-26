@@ -988,3 +988,29 @@ func TestDesensitization_NonStructPointerField(t *testing.T) {
 	assert.True(t, errors.As(err, &misuse))
 	assert.Equal(t, "*string", misuse.Type)
 }
+
+// TestNewDefaultDesensitizer 把内置类型注册到自定义 tag 名下
+//
+// 包外无法写 &DefaultDesensitizer{...}（字段不导出），所以这个构造函数是
+// 「用内置算法 + 自定义 tag 名」的唯一入口
+func TestNewDefaultDesensitizer(t *testing.T) {
+	d := NewDefaultDesensitizer(Email)
+	assert.Equal(t, "z*********ng@example.com", d.Desensitize("zhangsanfeng@example.com"))
+
+	RegisterDesensitizer("mycustomemail", NewDefaultDesensitizer(Email))
+	v, err := OperateByRule("mycustomemail", "zhangsanfeng@example.com")
+	require.NoError(t, err)
+	assert.Equal(t, "z*********ng@example.com", v)
+
+	// 在 tag 里同样可用
+	type model struct {
+		Addr string `desensitize:"mycustomemail"`
+	}
+	m := model{Addr: "zhangsanfeng@example.com"}
+	require.NoError(t, Desensitization(&m))
+	assert.Equal(t, "z*********ng@example.com", m.Addr)
+
+	// 每种内置类型都能这样包一层
+	assert.Equal(t, "181****8789", NewDefaultDesensitizer(MobilePhone).Desensitize("18175698789"))
+	assert.Equal(t, "张**", NewDefaultDesensitizer(ChineseName).Desensitize("张三丰"))
+}

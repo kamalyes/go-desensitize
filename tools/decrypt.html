@@ -113,7 +113,10 @@
 <div class="wrap">
 
   <h1>go-desensitize 解密调试台</h1>
-  <p class="sub">把日志里的 <code>enc:v1:</code> 密文解回原文，或核对 <code>***xxxxxxxx</code> 指纹对应哪个值</p>
+  <p class="sub">
+    把日志里的 <code>enc:v1:</code> 密文解回原文，反过来按已知明文算出密文或指纹去 grep 日志，
+    以及核对 <code>***xxxxxxxx</code> 指纹对应哪个值
+  </p>
 
   <div class="banner">
     <b>只从本地 file:// 打开，不要部署</b><br>
@@ -123,19 +126,26 @@
 
   <div class="banner demo">
     <b>页面已填入示例数据</b>，直接点下面的「解密」与「核对」就能看到效果<br>
-    示例用的是仓库测试里的公开演示密钥 <code>0123456789abcdef0123456789abcdef</code>，
-    <b>它是公开的，绝不可用于真实数据</b>换成自己的密钥前先点
+    示例预填了三把演示密钥，分别是 AES-256（base64）、AES-192（base64）、AES-128（hex），
+    用来演示「同一明文在不同密钥下密文不同、而指纹与密钥无关」<br>
+    日志行里的密文是用第一把加的，所以解密结果会标出 <code>K1</code><br>
+    <b>这三把都是写在源码里的公开密钥，绝不可用于真实数据</b>换成自己的密钥前先点
     <button class="ghost tiny" id="btnResetAll">清空全部</button>
   </div>
 
   <div class="panel">
     <h2>密钥 <span class="tag">AES-128 / 192 / 256</span></h2>
-    <p class="hint">与 <code>SetDefaultCipher</code> 用的同一把密钥，支持 base64 或 hex，自动识别</p>
+    <p class="hint">
+      与 <code>SetDefaultCipher</code> 用的同一把，支持 base64 或 hex，自动识别<br>
+      <b>可以一行一把填多个</b>：密钥轮换后旧日志还是旧密钥加的，解密时会逐把试，
+      并告诉你哪一把解开的反查则会把每把密钥的结果并排列出来，直接看出同一明文在不同密钥下长什么样
+    </p>
     <div class="row">
-      <label for="key">密钥</label>
-      <input type="text" id="key" spellcheck="false" autocomplete="off"
-             placeholder="MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=  或  3031...6566"
-             value="MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=">
+      <label for="key">密钥（每行一个）</label>
+      <textarea id="key" rows="3" spellcheck="false"
+                placeholder="MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=&#10;3031...6566">MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
+cm90YXRlZC1rZXktMjRieXRlcy1vbGQh
+aaaabbbbccccddddeeeeffff00001111</textarea>
     </div>
     <div id="keyInfo" class="dim" style="font-size:13px"></div>
   </div>
@@ -152,6 +162,23 @@
       <button class="ghost" id="btnClear">清空</button>
     </div>
     <div class="out" id="outDec"></div>
+  </div>
+
+  <div class="panel">
+    <h2>反查 <span class="tag">明文 → 密文 / 指纹</span></h2>
+    <p class="hint">
+      已经知道要查哪个会话时，反过来算出它在日志里长什么样，然后直接 grep<br>
+      只有确定性加密与指纹能这样用 —— 随机 nonce 的密文每次都不同，没法拿来搜
+    </p>
+    <div class="row">
+      <label for="plain">明文（每行一个）</label>
+      <textarea id="plain" rows="3" spellcheck="false">sess-abc123def456
+u-1001</textarea>
+    </div>
+    <div class="btns">
+      <button id="btnEnc">算密文与指纹</button>
+    </div>
+    <div id="outEnc"></div>
   </div>
 
   <div class="panel">
@@ -245,17 +272,32 @@ async function importKey(bytes) {
 
 // ---- 密钥面板 ----
 
+// parseKeys 逐行解析，返回 {label, bytes} 列表与各行的错误
+// 保留行号作为标签，这样解密结果能指出是第几把解开的
+function parseKeys(raw) {
+  const keys = [];
+  const errs = [];
+  const lines = raw.split('\n').map((x) => x.trim()).filter(Boolean);
+  lines.forEach((line, i) => {
+    const label = 'K' + (i + 1);
+    try {
+      keys.push({ label, bytes: parseKey(line), raw: line });
+    } catch (e) {
+      errs.push({ label, msg: e.message });
+    }
+  });
+  return { keys, errs };
+}
+
 $('key').addEventListener('input', () => {
   const info = $('keyInfo');
   const raw = $('key').value.trim();
-  if (!raw) { info.textContent = ''; return; }
-  try {
-    const b = parseKey(raw);
-    const bits = b.length * 8;
-    info.innerHTML = `<span class="ok">✓ 识别为 AES-${bits}，${b.length} 字节</span>`;
-  } catch (e) {
-    info.innerHTML = `<span class="err">✗ ${e.message}</span>`;
-  }
+  if (!raw) { info.innerHTML = ''; return; }
+  const { keys, errs } = parseKeys(raw);
+  const parts = keys.map(
+    (k) => `<span class="ok">✓ ${k.label} AES-${k.bytes.length * 8}</span>`);
+  parts.push(...errs.map((e) => `<span class="err">✗ ${e.label} ${esc(e.msg)}</span>`));
+  info.innerHTML = parts.join('　');
 });
 
 // 预填的密钥也要立刻走一次识别，让面板不是空的
@@ -291,30 +333,50 @@ async function decryptOne(key, token) {
 $('btnDec').addEventListener('click', async () => {
   const out = $('outDec');
   out.className = 'out';
-  try {
-    const key = await importKey(parseKey($('key').value));
-    const text = $('cipher').value;
-    const tokens = extractTokens(text);
-    if (!tokens.length) {
-      out.innerHTML = '<span class="dim">没有找到 enc:v1: 形态的密文</span>';
-      return;
-    }
 
-    const rows = [];
-    for (const tok of tokens) {
+  const { keys } = parseKeys($('key').value);
+  if (!keys.length) {
+    out.innerHTML = '<span class="err">没有可用的密钥，请至少填入一把</span>';
+    return;
+  }
+
+  const tokens = extractTokens($('cipher').value);
+  if (!tokens.length) {
+    out.innerHTML = '<span class="dim">没有找到 enc:v1: 形态的密文</span>';
+    return;
+  }
+
+  // 预先导入每把密钥，避免在循环里重复导入
+  const imported = [];
+  for (const k of keys) imported.push({ label: k.label, key: await importKey(k.bytes) });
+
+  const rows = [];
+  for (const tok of tokens) {
+    let done = false;
+    for (const { label, key } of imported) {
       try {
         const plain = await decryptOne(key, tok);
-        rows.push(`<tr><td class="mono dim">${esc(short(tok))}</td><td class="mono ok">${esc(plain)}</td></tr>`);
+        rows.push(
+          `<tr><td class="mono dim">${esc(short(tok))}</td>` +
+          `<td class="mono ok">${esc(plain)}</td>` +
+          `<td class="mono ok">${label}</td></tr>`);
+        done = true;
+        break;
       } catch (e) {
-        // GCM 认证失败不区分「密钥不对」与「密文被改动」，避免成为预言机
-        rows.push(`<tr><td class="mono dim">${esc(short(tok))}</td><td class="err">解不开：密钥不匹配或密文已损坏</td></tr>`);
+        // 继续试下一把：密钥轮换后旧日志需要旧密钥
       }
     }
-    out.innerHTML =
-      `<table><tr><th style="width:42%">密文</th><th>原文</th></tr>${rows.join('')}</table>`;
-  } catch (e) {
-    out.innerHTML = `<span class="err">${esc(e.message)}</span>`;
+    if (!done) {
+      // GCM 认证失败不区分「密钥不对」与「密文被改动」，避免成为预言机
+      rows.push(
+        `<tr><td class="mono dim">${esc(short(tok))}</td>` +
+        `<td class="err">所有密钥都解不开：密钥不匹配或密文已损坏</td><td class="dim">—</td></tr>`);
+    }
   }
+
+  out.innerHTML =
+    '<table><tr><th style="width:40%">密文</th><th>原文</th>' +
+    `<th style="width:76px">用哪把</th></tr>${rows.join('')}</table>`;
 });
 
 $('btnClear').addEventListener('click', () => {
@@ -324,10 +386,96 @@ $('btnClear').addEventListener('click', () => {
 
 // 换用真实密钥前先清空示例，免得把演示密钥当成自己的那把
 $('btnResetAll').addEventListener('click', () => {
-  for (const id of ['key', 'cipher', 'fp', 'cands']) $(id).value = '';
-  for (const id of ['outDec', 'outFp', 'keyInfo']) $(id).innerHTML = '';
+  for (const id of ['key', 'cipher', 'plain', 'fp', 'cands']) $(id).value = '';
+  for (const id of ['outDec', 'outEnc', 'outFp', 'keyInfo']) $(id).innerHTML = '';
   document.querySelector('.banner.demo').remove();
   $('key').focus();
+});
+
+// ---- 反查：明文 → 密文 / 指纹 ----
+
+// deriveMacKey 复现 Go 侧的 nonce 派生子密钥：HMAC-SHA256(key, 标签)
+// 标签必须与 cipher.go 里的字面量完全一致，否则算出的密文 grep 不到
+// [EN] Mirrors the Go-side subkey derivation; the label must match the literal
+// in cipher.go exactly, or the computed ciphertext will not match the logs
+async function deriveMacKey(keyBytes) {
+  const k = await crypto.subtle.importKey(
+    'raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return new Uint8Array(await crypto.subtle.sign('HMAC', k, te.encode('go-desensitize/siv/v1')));
+}
+
+// encryptDeterministic 复现 Go 侧 Cipher.EncryptDeterministic
+// nonce = HMAC-SHA256(子密钥, 明文) 截断到 12 字节，因此同一明文恒产出同一密文
+async function encryptDeterministic(keyBytes, plain) {
+  const macKeyBytes = await deriveMacKey(keyBytes);
+  const macKey = await crypto.subtle.importKey(
+    'raw', macKeyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const mac = new Uint8Array(await crypto.subtle.sign('HMAC', macKey, te.encode(plain)));
+  const iv = mac.slice(0, 12);
+
+  const aes = await crypto.subtle.importKey(
+    'raw', keyBytes, { name: 'AES-GCM' }, false, ['encrypt']);
+  const sealed = new Uint8Array(await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv, tagLength: 128 }, aes, te.encode(plain)));
+
+  const out = new Uint8Array(iv.length + sealed.length);
+  out.set(iv, 0);
+  out.set(sealed, iv.length);
+  return MARKER + bytesToB64url(out);
+}
+
+function bytesToB64url(b) {
+  let s = '';
+  for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+$('btnEnc').addEventListener('click', async () => {
+  const out = $('outEnc');
+  const lines = $('plain').value.split('\n').map((x) => x.trim()).filter(Boolean);
+  if (!lines.length) {
+    out.innerHTML = '<div class="out"><span class="dim">请至少填入一行明文</span></div>';
+    return;
+  }
+
+  const { keys } = parseKeys($('key').value);
+
+  const rows = [];
+  for (const plain of lines) {
+    const fp = await fingerprint(plain);
+
+    if (!keys.length) {
+      // 指纹不需要密钥，没填密钥也该把指纹算出来
+      rows.push(
+        `<tr><td class="mono">${esc(plain)}</td><td class="dim">—</td>` +
+        `<td class="mono ok">${esc(fp)}</td><td class="dim">没有可用的密钥</td></tr>`);
+      continue;
+    }
+
+    // 每把密钥一行，同一明文的指纹只在首行显示，便于看出
+    // 「指纹与密钥无关、密文随密钥而变」
+    for (const [i, k] of keys.entries()) {
+      let sealed;
+      try {
+        sealed = `<span class="mono ok">${esc(await encryptDeterministic(k.bytes, plain))}</span>`;
+      } catch (e) {
+        sealed = `<span class="err">${esc(e.message)}</span>`;
+      }
+      rows.push(
+        `<tr><td class="mono">${i === 0 ? esc(plain) : '<span class="dim">↑</span>'}</td>` +
+        `<td class="mono">${k.label}</td>` +
+        `<td class="mono ok">${i === 0 ? esc(fp) : '<span class="dim">↑ 同上</span>'}</td>` +
+        `<td>${sealed}</td></tr>`);
+    }
+  }
+
+  out.innerHTML =
+    '<table><tr><th style="width:20%">明文</th><th style="width:56px">密钥</th>' +
+    `<th style="width:16%">指纹</th><th>确定性密文</th></tr>${rows.join('')}</table>` +
+    '<div class="out dim">把任一串直接拿去 grep 日志即可' +
+    '注意<b>指纹与密钥无关</b>（同一明文在所有密钥下都是同一串），' +
+    '而<b>密文随密钥而变</b> —— 所以轮换密钥会让旧密文搜不到，' +
+    '而指纹跨轮换依然可用，代价是不可还原</div>';
 });
 
 // ---- 指纹核对 ----

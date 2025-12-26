@@ -281,9 +281,20 @@ During an incident review you have a log line containing `enc:v1:...` and need t
 value back. The repository ships an offline, single-file tool for that:
 [tools/decrypt.html](tools/decrypt.html)
 
-Open it locally in a browser, paste the key and the whole log line, and it finds every
-ciphertext in the text and resolves each one. It also verifies fingerprints in reverse: a
-fingerprint cannot be inverted, but you can supply candidate values and see which one matches
+Open it locally in a browser; it does three things:
+
+- **Decrypt**: paste a whole log line and every ciphertext in it is found and resolved
+- **Reverse lookup**: when you already know which session you are after, compute what it looks
+  like in the log and grep for that (only deterministic encryption and fingerprints work this
+  way, since a random-nonce ciphertext differs every time)
+- **Fingerprint check**: a fingerprint cannot be inverted, but you can supply candidates and
+  see which one matches
+
+Keys can be entered **one per line**: after a rotation, older log lines are still under the old
+key, so decryption tries each key and reports which one opened it. Reverse lookup lists every
+key's result side by side, making it plain that the fingerprint is key-independent while the
+ciphertext is not — rotation makes old ciphertexts unsearchable, whereas fingerprints survive
+it at the cost of not being recoverable
 
 ```bash
 open tools/decrypt.html          # macOS

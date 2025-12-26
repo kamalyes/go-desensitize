@@ -301,6 +301,12 @@ open tools/decrypt.html          # macOS
 xdg-open tools/decrypt.html      # Linux
 ```
 
+> ⚠️ **Key length limits**: Go's `aes.NewCipher` accepts 16, 24 or 32 bytes, while browser
+> WebCrypto supports **only 16 and 32**. A 24-byte (AES-192) server-side key leaves this console
+> unable to decrypt, with Chrome raising `192-bit AES keys are not supported`, so prefer 16 or 32
+> bytes when configuring a key. Note that Node's WebCrypto does support 192-bit, so verifying
+> there will not surface this
+
 > ⚠️ **Open it from local `file://` only; do not deploy it**
 > Hosting it with a key embedded hands a decryption oracle to everyone who can reach it, which
 > is worse than plaintext in the log — plaintext at least requires getting the log first

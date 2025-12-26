@@ -291,6 +291,10 @@ open tools/decrypt.html          # macOS
 xdg-open tools/decrypt.html      # Linux
 ```
 
+> ⚠️ **密钥长度限制**：Go 的 `aes.NewCipher` 接受 16 / 24 / 32 字节，而浏览器的 WebCrypto **只支持 16 与 32**
+> 服务端若用了 24 字节（AES-192）密钥，这个调试台解不开它的密文——Chrome 会直接抛 `192-bit AES keys are not supported`
+> 所以装配密钥时建议只用 16 或 32 字节（注意 Node.js 的 WebCrypto 是支持 192 位的，在 node 里验证不会暴露这条）
+
 > ⚠️ **只从本地 `file://` 打开，不要部署**
 > 带着密钥把它部署成网页，等于给所有能访问它的人开了一个解密预言机，比日志里直接存明文更糟——明文至少还需要先拿到日志
 > 该文件不引入任何外部资源、不发网络请求、不保存密钥，全部运算走浏览器自带的 WebCrypto

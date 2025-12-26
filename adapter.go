@@ -277,6 +277,87 @@ func OperateByRule(desensitizerType string, in interface{}) (interface{}, error)
 	return operator.Desensitize(in.(string)), nil
 }
 
+// TagName 结构体字段上声明脱敏规则所用的 tag 名
+//
+// 对外导出是为了让下游不必硬编码这个字面量：go-pbmo 这类库要在自己的字段
+// 计划里读同一个 tag，若各自写死字符串，这里改名下游不会报错、只会静默不再
+// 命中——脱敏静默失效正是最危险的失败方式
+// 本包内部读 tag 也走这个常量，保证只有一处来源
+//
+// [EN] Name of the struct tag that declares a masking rule. It is exported so
+// downstream libraries reading the same tag in their own field plans need not
+// hardcode the literal: if each side spelled it out and this name changed,
+// nothing would fail to compile and masking would simply stop matching in
+// silence, which is the most dangerous way for it to break. This package reads
+// the tag through the same constant, so there is a single source of truth
+const TagName = "desensitize"
+
+// MaskFunc 已绑定某个标签的脱敏函数，可长期持有并并发调用
+type MaskFunc func(value string) string
+
+// resolvedRule 某次解析的结果与其注册表代数
+type resolvedRule struct {
+	gen uint64
+	d   Desensitizer
+}
+
+// ResolveRule 解析一次标签，返回可长期复用、并发安全的脱敏函数
+//
+// 适用于上游在「计划构建期」解析、在热路径上反复调用的场景：
+// OperateByRule 每次调用都要重新查注册表、经 interface{} 装箱、并在未命中时
+// 返回 error，这些开销对每条记录都付一遍；而标签到脱敏器的映射只取决于标签
+// 本身与注册表代数，解析一次即可
+//
+// 返回的函数仍按代数自检：注册表变更（后注册或覆盖同名脱敏器）后自动重解析，
+// 因此不会把早期解析的结果永久固化——这是与「调用方自己缓存 Desensitizer」
+// 的关键区别
+// 稳态开销是两次原子读加一次整数比较，重解析失败时沿用上次结果
+//
+// [EN] Resolves a tag once and returns a reusable, concurrency-safe masking
+// function, for callers that resolve while building a plan and then call it per
+// record. OperateByRule re-reads the registry, boxes through interface{} and
+// allocates an error on a miss for every single call, yet the tag-to-desensitizer
+// mapping depends only on the tag and the registry generation. The returned
+// function still re-checks that generation, so a desensitizer registered or
+// overridden later takes effect instead of being frozen out — the key difference
+// from caching a Desensitizer yourself. Steady state is two atomic loads and an
+// integer compare; if re-resolution fails the previous result is kept
+// refreshRule 代数变化后的重解析，置于变量之后以便测试强制其失败
+//
+// 注册只增不减，因此一个解析成功过的标签不会再解析失败，这条分支实际不可达
+// 但它的行为必须被闸住：重解析失败时要沿用上次结果，而不是把 nil 脱敏器
+// 发布出去让热路径崩溃
+//
+// [EN] Re-resolution sits behind a variable so tests can force its failure
+// branch. Registration only ever adds, so a tag that resolved once cannot fail
+// later and the branch is unreachable in practice; its behaviour still matters,
+// as it must keep the previous result rather than publishing a nil desensitizer
+// that would crash the hot path
+var refreshRule = resolveDesensitizer
+
+func ResolveRule(tag string) (MaskFunc, error) {
+	state := loadRegistry()
+	d, err := resolveDesensitizer(state, tag)
+	if err != nil {
+		return nil, err
+	}
+	var cache atomic.Pointer[resolvedRule]
+	cache.Store(&resolvedRule{gen: state.gen, d: d})
+	return func(value string) string {
+		cur := loadRegistry()
+		got := cache.Load()
+		if got.gen != cur.gen {
+			// 代数变了：重解析并发布；并发下多个 goroutine 可能各解析一次，
+			// 结果等价，最后一个写入生效
+			if nd, nerr := refreshRule(cur, tag); nerr == nil {
+				got = &resolvedRule{gen: cur.gen, d: nd}
+				cache.Store(got)
+			}
+		}
+		return got.d.Desensitize(value)
+	}, nil
+}
+
 // TagMisuseError 字段的 desensitize tag 与字段类型不匹配
 //
 // 脱敏器只接受字符串，因此带 tag 的字段（或切片元素、映射值）必须是字符串形态
@@ -361,7 +442,7 @@ func buildTypePlan(t reflect.Type, state *registryState) *typePlan {
 		if !field.IsExported() {
 			continue
 		}
-		tag := field.Tag.Get("desensitize")
+		tag := field.Tag.Get(TagName)
 		ft := field.Type
 
 		switch ft.Kind() {
@@ -519,30 +600,42 @@ func builtinRegistry() *registryState {
 	byName := map[string]Desensitizer{
 		"email":        &DefaultDesensitizer{Email},
 		"phoneNumber":  &DefaultDesensitizer{PhoneNumber},
+		"phone":        &DefaultDesensitizer{PhoneNumber},
 		"name":         &DefaultDesensitizer{ChineseName},
 		"identityCard": &DefaultDesensitizer{IDCard},
+		"idCard":       &DefaultDesensitizer{IDCard},
 		"mobilePhone":  &DefaultDesensitizer{MobilePhone},
+		"mobile":       &DefaultDesensitizer{MobilePhone},
 		"address":      &DefaultDesensitizer{Address},
 		"password":     &DefaultDesensitizer{Password},
 		"carLicense":   &DefaultDesensitizer{CarLicense},
 		"bankCard":     &DefaultDesensitizer{BankCard},
 		"ipv4":         &DefaultDesensitizer{IPV4},
 		"ipv6":         &DefaultDesensitizer{IPV6},
-		"apiKey":       &DefaultDesensitizer{APIKey},
-		"apikey":       &DefaultDesensitizer{APIKey},
-		"secret":       &DefaultDesensitizer{Secret},
-		"secretKey":    &DefaultDesensitizer{Secret},
-		"userId":       &DefaultDesensitizer{UserID},
-		"userid":       &DefaultDesensitizer{UserID},
-		"playerId":     &DefaultDesensitizer{PlayerID},
-		"playerid":     &DefaultDesensitizer{PlayerID},
-		"orderNo":      &DefaultDesensitizer{OrderNo},
-		"orderno":      &DefaultDesensitizer{OrderNo},
-		"uuid":         &DefaultDesensitizer{UUID},
-		"openId":       &DefaultDesensitizer{OpenID},
-		"openid":       &DefaultDesensitizer{OpenID},
-		"unionId":      &DefaultDesensitizer{OpenID},
-		"account":      &DefaultDesensitizer{Account},
+		"ip":           &DefaultDesensitizer{IPV4},
+		// PEMKey 此前没有任何注册名：desensitize:"pemKey" 这个 tag 解析不到，
+		// 既不报错也不脱敏，私钥与证书内容就这样原样落进输出
+		// [EN] PEMKey had no registered name at all, so a desensitize:"pemKey"
+		// tag resolved to nothing — neither failing nor masking — and private
+		// keys and certificates went through untouched
+		"pemKey":     &DefaultDesensitizer{PEMKey},
+		"apiKey":     &DefaultDesensitizer{APIKey},
+		"apikey":     &DefaultDesensitizer{APIKey},
+		"api_key":    &DefaultDesensitizer{APIKey},
+		"secret":     &DefaultDesensitizer{Secret},
+		"secretKey":  &DefaultDesensitizer{Secret},
+		"secret_key": &DefaultDesensitizer{Secret},
+		"userId":     &DefaultDesensitizer{UserID},
+		"userid":     &DefaultDesensitizer{UserID},
+		"playerId":   &DefaultDesensitizer{PlayerID},
+		"playerid":   &DefaultDesensitizer{PlayerID},
+		"orderNo":    &DefaultDesensitizer{OrderNo},
+		"orderno":    &DefaultDesensitizer{OrderNo},
+		"uuid":       &DefaultDesensitizer{UUID},
+		"openId":     &DefaultDesensitizer{OpenID},
+		"openid":     &DefaultDesensitizer{OpenID},
+		"unionId":    &DefaultDesensitizer{OpenID},
+		"account":    &DefaultDesensitizer{Account},
 	}
 	// 跳步脱敏器工厂：标签格式为 jump(开始,结束,跳步)，如 desensitize:"jump(3,-4,1)"
 	factories := map[string]DesensitizerFactory{

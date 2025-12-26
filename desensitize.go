@@ -31,21 +31,29 @@ func Desensitize(str string, DesensitizeType DesensitizeType, options ...Desensi
 	case CustomExtension:
 		newStr = SensitiveData(str, opt.CustomExtensionStartIndex, opt.CustomExtensionEndIndex)
 	case ChineseName:
-		newStr = SensitiveData(str, opt.ChineseNameStartIndex, 1+(runeLen(str)-2)/2)
+		n := runeLen(str)
+		newStr = sensitiveDataN(str, opt.ChineseNameStartIndex, 1+(n-2)/2, n)
 	case IDCard:
-		newStr = SensitiveData(str, opt.IdCardStartIndex, runeLen(str)-4)
+		n := runeLen(str)
+		newStr = sensitiveDataN(str, opt.IdCardStartIndex, n-4, n)
 	case PhoneNumber:
 		newStr = SensitizePhoneNumber(str, opt.PhoneNumberStartIndex, opt.PhoneNumberEndIndex)
 	case MobilePhone:
-		newStr = SensitiveData(str, opt.MobilePhoneStartIndex, runeLen(str)-4)
+		n := runeLen(str)
+		newStr = sensitiveDataN(str, opt.MobilePhoneStartIndex, n-4, n)
 	case Address:
-		newStr = SensitiveData(str, runeLen(str)/3, runeLen(str)-3)
+		// 原先这一行里 runeLen 被调两次，加上 SensitiveData 内部与 hide 各一遍，
+		// 一次脱敏要把字符串扫四趟，多字节地址上尤其明显
+		n := runeLen(str)
+		newStr = sensitiveDataN(str, n/3, n-3, n)
 	case Email:
-		newStr = SensitiveData(str, opt.EmailStartIndex, indexOf(str, "@")-2)
+		newStr = sensitiveDataN(str, opt.EmailStartIndex, indexOf(str, "@")-2, runeLen(str))
 	case Password:
-		newStr = SensitiveData(str, 0, runeLen(str))
+		n := runeLen(str)
+		newStr = sensitiveDataN(str, 0, n, n)
 	case CarLicense:
-		newStr = SensitiveData(str, 3, runeLen(str)-2)
+		n := runeLen(str)
+		newStr = sensitiveDataN(str, 3, n-2, n)
 	case BankCard:
 		newStr = SensitizeBankCard(str, opt.IdCardLength)
 	case IPV4:
@@ -74,9 +82,25 @@ func SensitiveData(str string, start, end int) string {
 		return str
 	}
 
-	// 获取字符数量
-	charCount := utf8.RuneCountInString(str)
+	return sensitiveDataN(str, start, end, utf8.RuneCountInString(str))
+}
 
+// sensitiveDataN 与 SensitiveData 相同，但字符数由调用方传入
+//
+// Desensitize 的多个分支本就要先知道字符数才能算出 start/end，
+// 原先那个结果被丢掉、进了 SensitiveData 又重新数一遍
+// 多字节输入下每一趟都是完整解码，省掉它比省一次分配更划算
+//
+// [EN] Several branches of Desensitize already need the rune count to compute
+// start and end, and the original threw that result away so SensitiveData could
+// count again. Each pass is a full decode for multi-byte input, so dropping one
+// buys more than dropping an allocation
+// 前置条件：str 非空白，charCount 为其字符数
+// 两个调用方（Desensitize 与 SensitiveData）都已在入口查过空白，这里不再重复扫一遍
+//
+// [EN] Precondition: str is non-blank and charCount is its rune count. Both
+// callers already check for blank at their entry, so the scan is not repeated
+func sensitiveDataN(str string, start, end, charCount int) string {
 	// 调整起始位置和结束位置
 	if start <= 0 || start >= charCount {
 		start = 1
@@ -93,7 +117,7 @@ func SensitiveData(str string, start, end int) string {
 	}
 
 	// 对指定位置的敏感数据进行隐藏处理
-	return hide(str, start, end)
+	return hide(str, start, end, charCount)
 }
 
 // SensitizeJump 跳步脱敏：掩码 [start, end) 区间内从 start 开始、以 step 为步长跳步选取的字符
@@ -191,7 +215,8 @@ func SensitizeBankCard(str string, cardLength int) string {
 	// 在中间部分的最末尾插入一个空格
 	newCardNo = append(newCardNo, ' ')
 	// 添加卡号的最后4位
-	lastFour := cleanCardNo[runeLen(cleanCardNo)-4:]
+	// 复用上面已求出的 length：此处沿用上游按字节索引的语义，取值完全相同
+	lastFour := cleanCardNo[length-4:]
 	newCardNo = append(newCardNo, []rune(lastFour)...)
 
 	// 返回格式化后的卡号
@@ -227,17 +252,68 @@ func SensitizePEMKey(str string, prefixVisibleLen, suffixVisibleLen int) string 
 		return str
 	}
 
-	lines := strings.Split(normalized, "\n")
-	if len(lines) < 3 || !strings.HasPrefix(lines[0], "-----BEGIN ") || !strings.HasPrefix(lines[len(lines)-1], "-----END ") {
+	// 只定位首尾两个换行，不切行也不拼接正文
+	// 原实现是 Split 出整个行切片、Join 出正文、再 Join 出结果，三次中间分配，
+	// 而正文在掩码后其实只剩「首若干字符 + 星号 + 末若干字符」，用不着先拼出来
+	//
+	// [EN] Locates only the first and last newline instead of splitting into a
+	// line slice, joining the body and joining the result again — three
+	// intermediate allocations for a body that, once masked, is just a few
+	// leading runes, a run of stars and a few trailing ones
+	firstNL := strings.IndexByte(normalized, '\n')
+	lastNL := strings.LastIndexByte(normalized, '\n')
+	// firstNL == lastNL 等价于原先的 len(lines) < 3（少于两个换行）
+	if firstNL < 0 || firstNL == lastNL ||
+		!strings.HasPrefix(normalized, "-----BEGIN ") ||
+		!strings.HasPrefix(normalized[lastNL+1:], "-----END ") {
 		return sensitizeSecretSegment(normalized, prefixVisibleLen, suffixVisibleLen)
 	}
 
-	body := strings.Join(lines[1:len(lines)-1], "")
-	return strings.Join([]string{
-		lines[0],
-		sensitizeSecretSegment(body, prefixVisibleLen, suffixVisibleLen),
-		lines[len(lines)-1],
-	}, "\n")
+	header := normalized[:firstNL]
+	bodyRegion := normalized[firstNL+1 : lastNL]
+	footer := normalized[lastNL+1:]
+
+	if prefixVisibleLen < 0 {
+		prefixVisibleLen = 0
+	}
+	if suffixVisibleLen < 0 {
+		suffixVisibleLen = 0
+	}
+
+	// 正文字符数按「去掉换行后」计，与原先先 Join 再数的结果一致
+	bodyRunes := 0
+	for _, r := range bodyRegion {
+		if r != '\n' {
+			bodyRunes++
+		}
+	}
+
+	var b strings.Builder
+	// 上界：掩码只会让字节数变少（多字节字符换成单字节星号）
+	b.Grow(len(header) + len(footer) + len(bodyRegion) + 2)
+	b.WriteString(header)
+	b.WriteByte('\n')
+	if prefixVisibleLen+suffixVisibleLen >= bodyRunes {
+		for i := 0; i < bodyRunes; i++ {
+			b.WriteByte('*')
+		}
+	} else {
+		idx := 0
+		for _, r := range bodyRegion {
+			if r == '\n' {
+				continue
+			}
+			if idx < prefixVisibleLen || idx >= bodyRunes-suffixVisibleLen {
+				b.WriteRune(r)
+			} else {
+				b.WriteByte('*')
+			}
+			idx++
+		}
+	}
+	b.WriteByte('\n')
+	b.WriteString(footer)
+	return b.String()
 }
 
 func sensitizeSecretSegment(secret string, prefixVisibleLen, suffixVisibleLen int) string {
@@ -257,5 +333,5 @@ func sensitizeSecretSegment(secret string, prefixVisibleLen, suffixVisibleLen in
 		return strings.Repeat("*", charCount)
 	}
 
-	return hide(secret, prefixVisibleLen, charCount-suffixVisibleLen)
+	return hide(secret, prefixVisibleLen, charCount-suffixVisibleLen, charCount)
 }

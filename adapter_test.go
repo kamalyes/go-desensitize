@@ -1014,3 +1014,148 @@ func TestNewDefaultDesensitizer(t *testing.T) {
 	assert.Equal(t, "181****8789", NewDefaultDesensitizer(MobilePhone).Desensitize("18175698789"))
 	assert.Equal(t, "张**", NewDefaultDesensitizer(ChineseName).Desensitize("张三丰"))
 }
+
+// prefixDesensitizer 固定前缀的桩脱敏器，用于区分「重解析前后用的是哪一个」
+type prefixDesensitizer struct{ prefix string }
+
+func (p prefixDesensitizer) Desensitize(v string) string { return p.prefix + v }
+
+// TestResolveRule_PlainAndParameterized 普通名称与带参数形式都能解析，未命中各自报错
+func TestResolveRule_PlainAndParameterized(t *testing.T) {
+	mask, err := ResolveRule("email")
+	require.NoError(t, err)
+	assert.Equal(t, "z*****an@example.com", mask("zhangsan@example.com"))
+
+	// 带参数形式经工厂创建：保留前 3 位与后 4 位
+	jump, err := ResolveRule("jump(3,-4,1)")
+	require.NoError(t, err)
+	assert.Equal(t, "138****8000", jump("13800138000"))
+
+	// 工厂名已注册但未带参数时，以默认参数创建
+	bare, err := ResolveRule("jump")
+	require.NoError(t, err)
+	assert.Equal(t, "***********", bare("13800138000"))
+
+	// 未注册的普通名称与未注册的工厂名，命中不同哨兵错误
+	_, err = ResolveRule("no_such_rule")
+	assert.ErrorIs(t, err, errDesensitizerNotFound)
+	_, err = ResolveRule("no_such_factory(1,2)")
+	assert.ErrorIs(t, err, errFactoryNotFound)
+}
+
+// TestResolveRule_RefreshesAfterRegistration 注册表代数变化后自动重解析
+//
+// 这是 ResolveRule 与「调用方自己缓存 Desensitizer」的关键差别：
+// 覆盖同名脱敏器之后，先前解析出的 MaskFunc 必须跟着改变，而不是固化旧实现
+func TestResolveRule_RefreshesAfterRegistration(t *testing.T) {
+	const name = "resolve_rule_refresh"
+	RegisterDesensitizer(name, prefixDesensitizer{prefix: "old:"})
+
+	mask, err := ResolveRule(name)
+	require.NoError(t, err)
+	assert.Equal(t, "old:v", mask("v"))
+
+	// 覆盖同名实现会递增代数，MaskFunc 下次调用即自检并重解析
+	RegisterDesensitizer(name, prefixDesensitizer{prefix: "new:"})
+	assert.Equal(t, "new:v", mask("v"))
+}
+
+// TestResolveRule_KeepsPreviousWhenRefreshFails 重解析失败时沿用上次结果
+//
+// 该分支实际不可达（注册只增不减），但必须保证它不会发布 nil 脱敏器
+func TestResolveRule_KeepsPreviousWhenRefreshFails(t *testing.T) {
+	const name = "resolve_rule_refresh_fail"
+	RegisterDesensitizer(name, prefixDesensitizer{prefix: "kept:"})
+
+	mask, err := ResolveRule(name)
+	require.NoError(t, err)
+	assert.Equal(t, "kept:v", mask("v"))
+
+	orig := refreshRule
+	refreshRule = func(*registryState, string) (Desensitizer, error) {
+		return nil, errDesensitizerNotFound
+	}
+	defer func() { refreshRule = orig }()
+
+	// 递增代数迫使 MaskFunc 走重解析，而重解析被强制失败
+	RegisterDesensitizer("resolve_rule_bump_gen", prefixDesensitizer{prefix: "x:"})
+	assert.Equal(t, "kept:v", mask("v"), "重解析失败应沿用上次解析结果")
+}
+
+// TestResolveRule_ConcurrentCallsAreSafe 并发调用与并发代数变化下不崩不竞争
+func TestResolveRule_ConcurrentCallsAreSafe(t *testing.T) {
+	const name = "resolve_rule_concurrent"
+	RegisterDesensitizer(name, prefixDesensitizer{prefix: "a:"})
+	mask, err := ResolveRule(name)
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				assert.True(t, strings.HasSuffix(mask("v"), ":v"))
+			}
+		}()
+	}
+	// 另一侧持续递增代数，逼出「自检 → 重解析 → 发布」与读取的交错
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for j := 0; j < 50; j++ {
+			RegisterDesensitizer(name, prefixDesensitizer{prefix: "b:"})
+		}
+	}()
+	wg.Wait()
+}
+
+// TestBuiltinRegistry_EveryTypeHasRegisteredName 每个脱敏类型都必须至少有一个 tag 名
+//
+// PEMKey 曾经一个名字都没有：desensitize:"pemKey" 解析不到任何脱敏器，
+// 既不报错也不脱敏，私钥内容原样输出
+// 这类缺口不会让任何测试变红，只会在泄漏时才被发现，所以在这里闸住
+func TestBuiltinRegistry_EveryTypeHasRegisteredName(t *testing.T) {
+	named := make(map[DesensitizeType]string)
+	for name, d := range builtinRegistry().byName {
+		if dd, ok := d.(*DefaultDesensitizer); ok {
+			named[dd.desensitizerType] = name
+		}
+	}
+
+	// CustomExtension 的语义依赖起止下标，由 jump 工厂以带参数形式覆盖，不占固定名
+	for typ := ChineseName; typ <= Account; typ++ {
+		assert.NotEmpty(t, named[typ], "脱敏类型 %d 没有任何注册名，对应 tag 会静默失效", typ)
+	}
+}
+
+// TestBuiltinRegistry_AliasesResolveToSameRule 别名与规范名脱敏结果一致
+//
+// 这些写法（snake_case 与简称）在真实代码里与规范名同样常见，
+// 过去只能由每个下游各自维护一份别名表，表一漂移就有 tag 静默不再命中
+func TestBuiltinRegistry_AliasesResolveToSameRule(t *testing.T) {
+	cases := []struct{ alias, canonical, sample string }{
+		{"phone", "phoneNumber", "13800138000"},
+		{"mobile", "mobilePhone", "13800138000"},
+		{"idCard", "identityCard", "11010119900307123X"},
+		{"ip", "ipv4", "192.168.1.100"},
+		{"api_key", "apiKey", "ak-abcdefghijklmnop"},
+		{"secret_key", "secretKey", "sk-abcdefghijklmnop"},
+	}
+	for _, c := range cases {
+		t.Run(c.alias, func(t *testing.T) {
+			alias, err := ResolveRule(c.alias)
+			require.NoError(t, err)
+			canonical, err := ResolveRule(c.canonical)
+			require.NoError(t, err)
+			assert.Equal(t, canonical(c.sample), alias(c.sample))
+			assert.NotEqual(t, c.sample, alias(c.sample), "别名必须真的脱敏，排除原样返回的假通过")
+		})
+	}
+
+	// pemKey 没有规范名的对照，单独断言它确实生效
+	pem, err := ResolveRule("pemKey")
+	require.NoError(t, err)
+	const key = "-----BEGIN RSA PRIVATE KEY-----MIIEowIBAAKCAQEAabcdefghij-----END RSA PRIVATE KEY-----"
+	assert.NotEqual(t, key, pem(key), "pemKey 必须生效，否则私钥原样输出")
+}

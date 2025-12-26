@@ -341,22 +341,31 @@ buf = desensitize.AppendMaskedEmail(buf, "a@example.com")     // a***@example.co
 
 ## 📋 内置脱敏类型
 
-| 类型 | 说明 | 示例输入 | 示例输出 |
-|------|------|----------|----------|
-| `ChineseName` | 中文姓名 | 张三丰 | `张**` |
-| `IDCard` | 身份证号 | 310101199001015678 | `310101********5678` |
-| `PhoneNumber` | 固话/号码 | 18175698789 | `181****8789` |
-| `MobilePhone` | 手机号 | 18175698789 | `181****8789` |
-| `Address` | 地址 | 北京市朝阳区某某路99号 | `北京市朝*****99号` |
-| `Email` | 邮箱 | zhangsanfeng@example.com | `z*********ng@example.com` |
-| `Password` | 密码 | hunter2 | `h******` |
-| `CarLicense` | 车牌号 | 京A12345 | `京A1**45` |
-| `BankCard` | 银行卡号 | 6222025678565678 | `6222 **** **** **** 5678` |
-| `IPV4` / `IPV6` | IP 地址 | 192.168.1.1 | `192.*.*.*` |
-| `PEMKey` | PEM 密钥 | -----BEGIN ... | 首尾行保留，正文掩码 |
-| `APIKey` / `Secret` | 密钥 | sk-abcdefghijklmnopqrstuvwxyz | `sk-a*********************wxyz` |
-| `UserID` / `PlayerID` / `OrderNo` / `UUID` / `OpenID` / `Account` | 各类 ID | 1234567890 | `12******90` |
-| `CustomExtension` | 自定义 | 由 `DesensitizeOptions` 控制 | - |
+**tag 名**那一列才是写在 `desensitize:"..."` 里的东西，类型名是给
+`Desensitize(s, typ)` 用的 Go 常量
+把类型名写进 tag 解析不到，字段会原样输出而且不报错
+
+| tag 名 | 类型 | 说明 | 示例输入 | 示例输出 |
+|--------|------|------|----------|----------|
+| `name` | `ChineseName` | 中文姓名 | 张三丰 | `张**` |
+| `identityCard` / `idCard` | `IDCard` | 身份证号 | 310101199001015678 | `310101********5678` |
+| `phoneNumber` / `phone` | `PhoneNumber` | 固话/号码 | 18175698789 | `181****8789` |
+| `mobilePhone` / `mobile` | `MobilePhone` | 手机号 | 18175698789 | `181****8789` |
+| `address` | `Address` | 地址 | 北京市朝阳区某某路99号 | `北京市朝*****99号` |
+| `email` | `Email` | 邮箱 | zhangsanfeng@example.com | `z*********ng@example.com` |
+| `password` | `Password` | 密码 | hunter2 | `h******` |
+| `carLicense` | `CarLicense` | 车牌号 | 京A12345 | `京A1**45` |
+| `bankCard` | `BankCard` | 银行卡号 | 6222025678565678 | `6222 **** **** **** 5678` |
+| `ipv4` / `ipv6` / `ip` | `IPV4` / `IPV6` | IP 地址 | 192.168.1.1 | `192.*.*.*` |
+| `pemKey` | `PEMKey` | PEM 密钥 | -----BEGIN ... | 首尾行保留，正文掩码 |
+| `apiKey` / `apikey` / `api_key` | `APIKey` | API 密钥 | sk-abcdefghijklmnopqrstuvwxyz | `sk-a*********************wxyz` |
+| `secret` / `secretKey` / `secret_key` | `Secret` | Secret | sk-abcdefghijklmnopqrstuvwxyz | `sk-a*********************wxyz` |
+| `userId` / `playerId` / `orderNo` / `uuid` / `openId` / `unionId` / `account` | `UserID` / `PlayerID` / `OrderNo` / `UUID` / `OpenID` / `Account` | 各类 ID | 1234567890 | `12******90` |
+| `jump(开始,结束,跳步)` | `CustomExtension` | 自定义区间 | ABCDEFGHIJKLMNOP | `ABC*********MNOP` |
+
+`CustomExtension` 没有固定 tag 名：它由 `DesensitizeOptions` 经 `Desensitize`
+驱动，而参数化的 `jump` tag 以声明方式覆盖同一需求
+其余每个类型都至少有一个 tag 名，并由测试闸住
 
 ### 自定义脱敏器
 

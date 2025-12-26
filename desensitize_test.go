@@ -382,3 +382,18 @@ func TestSensitizePhoneNumber_Variants(t *testing.T) {
 	// 短输入先被补位到 11 位
 	assert.Contains(t, SensitizePhoneNumber("1817789", 3, 7), "*")
 }
+
+// TestSensitizePEMKey_NegativeVisibleLens 可见长度为负时夹到 0，整段正文被掩码
+func TestSensitizePEMKey_NegativeVisibleLens(t *testing.T) {
+	const pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\nabcdefghijklmnop\n-----END RSA PRIVATE KEY-----"
+
+	got := SensitizePEMKey(pem, -1, -5)
+	assert.Equal(t,
+		"-----BEGIN RSA PRIVATE KEY-----\n********************************\n-----END RSA PRIVATE KEY-----",
+		got, "负的可见长度应夹到 0，正文全部掩码")
+
+	// 可见长度之和不小于正文字符数时同样整段掩码
+	assert.Equal(t,
+		"-----BEGIN RSA PRIVATE KEY-----\n********************************\n-----END RSA PRIVATE KEY-----",
+		SensitizePEMKey(pem, 999, 999))
+}

@@ -80,7 +80,17 @@ func cleanSpaces(s string) string {
 // endExclude can slip past the rune count. Every call site in this library
 // clamps to the rune count first, so the path is unreachable; the arithmetic is
 // kept as-is rather than silently changing established behaviour
-func hide(s string, startInclude, endExclude int) string {
+// charCount 由调用方传入其字符数，-1 表示未知
+// 调用方多半刚刚数过纯 ASCII 时字符数等于字节数，此时字符下标就是字节下标，
+// 连那一趟解码都不必走——而 ASCII 正是手机号、身份证、卡号、密钥、
+// PEM 正文这些输入的常态
+//
+// [EN] charCount is the caller's rune count, or -1 when unknown. Callers have
+// usually just computed it; when it equals the byte length the input is pure
+// ASCII, rune indexes are byte indexes and even the decoding pass can be
+// skipped — and ASCII is the normal case for phone numbers, ID numbers, card
+// numbers, secrets and PEM bodies
+func hide(s string, startInclude, endExclude, charCount int) string {
 	if startInclude < 0 {
 		startInclude = 0
 	}
@@ -91,21 +101,71 @@ func hide(s string, startInclude, endExclude int) string {
 		return s
 	}
 
-	runes := []rune(s)
+	// 纯 ASCII 快路：下标无需换算
+	if charCount == len(s) {
+		count := endExclude - startInclude
+		if count <= 0 {
+			return s
+		}
+		var b strings.Builder
+		b.Grow(len(s))
+		b.WriteString(s[:startInclude])
+		for i := 0; i < count; i++ {
+			b.WriteByte('*')
+		}
+		b.WriteString(s[endExclude:])
+		return b.String()
+	}
+
+	// 单次游走求出两个字符下标对应的字节偏移，顺带得到字符总数
+	// 原实现先 []rune(s) 再 string(runes[:n]) 两次往返：短输入靠栈缓冲没有分配，
+	// 但每个字符都被解码一次又重编码一次，时间全要付
+	// 这里保留的两段都是原串的字节切片，不解码也不重编码
+	//
+	// [EN] One pass to map both rune indexes to byte offsets. The original went
+	// string -> []rune -> string, which avoids allocating for short inputs
+	// thanks to the stack buffer but still decodes and re-encodes every rune.
+	// Both kept segments are byte slices of the original here, so neither
+	// happens
+	startByte, endByte := -1, -1
+	runeCount := 0
+	for i := range s {
+		if runeCount == startInclude {
+			startByte = i
+		}
+		if runeCount == endExclude {
+			endByte = i
+		}
+		runeCount++
+	}
+	if runeCount == startInclude {
+		startByte = len(s)
+	}
+	if runeCount == endExclude {
+		endByte = len(s)
+	}
+
+	// 下标越过字符数：复现上游按字符切片的越界 panic（见 TestHide_ByteVsRune）
+	if startByte < 0 || endByte < 0 {
+		runes := []rune(s)
+		_ = runes[startInclude:]
+		_ = runes[endExclude:]
+	}
+
 	count := endExclude - startInclude
 	if count <= 0 {
 		// 对应上游 RepeatByLength 在 padLen <= 0 时返回空串
-		return string(runes[:startInclude]) + string(runes[endExclude:])
+		return s[:startByte] + s[endByte:]
 	}
 
 	// 上游 RepeatByLength("*", n) 逐个 append 单字符 rune，等价于 Repeat
 	var b strings.Builder
-	b.Grow(len(s) + count)
-	b.WriteString(string(runes[:startInclude]))
+	b.Grow(startByte + count + len(s) - endByte)
+	b.WriteString(s[:startByte])
 	for i := 0; i < count; i++ {
 		b.WriteByte('*')
 	}
-	b.WriteString(string(runes[endExclude:]))
+	b.WriteString(s[endByte:])
 	return b.String()
 }
 

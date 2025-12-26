@@ -459,11 +459,39 @@ func BenchmarkMaskPhoneString(b *testing.B) {
 	}
 }
 
-func BenchmarkComponent_hide(b *testing.B) {
+// BenchmarkComponent_hide_ASCII 纯 ASCII 快路：字符下标即字节下标，无需解码
+func BenchmarkComponent_hide_ASCII(b *testing.B) {
+	const s = "310101199001015678"
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if hide("310101199001015678", 6, 14) == "" {
+		if hide(s, 6, 14, len(s)) == "" {
+			b.Fatal("empty")
+		}
+	}
+}
+
+// BenchmarkComponent_hide_Walk 字符数未知或多字节：需游走一遍求字节偏移
+// 与 ASCII 快路的差额就是省掉的那趟解码
+func BenchmarkComponent_hide_Walk(b *testing.B) {
+	const s = "310101199001015678"
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if hide(s, 6, 14, -1) == "" {
+			b.Fatal("empty")
+		}
+	}
+}
+
+// BenchmarkComponent_hide_MultiByte 多字节输入，必定走游走路径
+func BenchmarkComponent_hide_MultiByte(b *testing.B) {
+	const s = "北京市海淀区中关村大街1号院"
+	n := runeLen(s)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if hide(s, 4, n-3, n) == "" {
 			b.Fatal("empty")
 		}
 	}

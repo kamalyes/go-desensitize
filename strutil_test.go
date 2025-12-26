@@ -47,16 +47,16 @@ func TestCleanSpaces(t *testing.T) {
 }
 
 func TestHide(t *testing.T) {
-	assert.Equal(t, "a***e", hide("abcde", 1, 4))
-	assert.Equal(t, "*****", hide("abcde", 0, 5))
-	assert.Equal(t, "abcde", hide("abcde", 4, 1), "起点大于终点原样返回")
+	assert.Equal(t, "a***e", hide("abcde", 1, 4, 5))
+	assert.Equal(t, "*****", hide("abcde", 0, 5, 5))
+	assert.Equal(t, "abcde", hide("abcde", 4, 1, 5), "起点大于终点原样返回")
 	// count <= 0 分支：起点等于终点，拼接两段即原串
-	assert.Equal(t, "abcde", hide("abcde", 2, 2))
+	assert.Equal(t, "abcde", hide("abcde", 2, 2, 5))
 	// 负数起点夹到 0
-	assert.Equal(t, "***de", hide("abcde", -3, 3))
+	assert.Equal(t, "***de", hide("abcde", -3, 3, 5))
 	// 终点超过字节长度被夹到字节长度
-	assert.Equal(t, "*****", hide("abcde", 0, 99))
-	assert.Equal(t, "", hide("", 0, 0))
+	assert.Equal(t, "*****", hide("abcde", 0, 99, 5))
+	assert.Equal(t, "", hide("", 0, 0, 0))
 }
 
 // TestHide_ByteVsRune 上游遗留的索引混用：边界按字节夹取，切片按字符
@@ -66,10 +66,10 @@ func TestHide(t *testing.T) {
 func TestHide_ByteVsRune(t *testing.T) {
 	// "张三丰" 字节长 9、字符数 3终点 5 不超过字节长度 9，故不被夹取，
 	// 但按字符切片时 runes[5:] 会越界
-	assert.Panics(t, func() { hide("张三丰", 0, 5) },
+	assert.Panics(t, func() { hide("张三丰", 0, 5, 3) },
 		"多字节输入下终点介于字符数与字节数之间会越界，这是上游既有行为")
 	// 终点在字符数之内时正常
-	assert.Equal(t, "*三丰", hide("张三丰", 0, 1))
+	assert.Equal(t, "*三丰", hide("张三丰", 0, 1, 3))
 }
 
 func TestPadMiddle(t *testing.T) {
@@ -100,4 +100,26 @@ func TestSubBefore(t *testing.T) {
 	assert.Equal(t, "  ", subBefore("  ", "."))
 	assert.Equal(t, "a.b", subBefore("a.b", ""))
 	assert.Equal(t, "a.b", subBefore("a.b", " "))
+}
+
+// TestHide_ASCIIFastPath 纯 ASCII 时下标不必换算，结果须与走解码的慢路一致
+//
+// 快路由调用方传入的字符数触发（等于字节长度即 ASCII），
+// 一旦两条路出现分歧，就会变成「同一个值在不同输入下擦法不同」
+func TestHide_ASCIIFastPath(t *testing.T) {
+	cases := []struct{ s string }{{"abcde"}, {"a"}, {"1234567890"}, {""}}
+	for _, c := range cases {
+		for start := -1; start <= len(c.s)+1; start++ {
+			for end := -1; end <= len(c.s)+1; end++ {
+				fast := hide(c.s, start, end, len(c.s))
+				slow := hide(c.s, start, end, -1)
+				assert.Equal(t, slow, fast,
+					"ASCII 快路与慢路分歧: s=%q start=%d end=%d", c.s, start, end)
+			}
+		}
+	}
+
+	// 起点等于终点：快路的 count <= 0 分支，原样返回
+	assert.Equal(t, "abcde", hide("abcde", 2, 2, 5))
+	assert.Equal(t, "a***e", hide("abcde", 1, 4, 5))
 }

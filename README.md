@@ -355,22 +355,31 @@ So the model path **never touches the rule table** and honours only the tags you
 
 ## 📋 Built-in masking types
 
-| Type | Description | Example input | Example output |
-|------|------|----------|----------|
-| `ChineseName` | Chinese name | 张三丰 | `张**` |
-| `IDCard` | national ID | 310101199001015678 | `310101********5678` |
-| `PhoneNumber` | phone number | 18175698789 | `181****8789` |
-| `MobilePhone` | mobile number | 18175698789 | `181****8789` |
-| `Address` | address | 北京市朝阳区某某路99号 | `北京市朝*****99号` |
-| `Email` | email | zhangsanfeng@example.com | `z*********ng@example.com` |
-| `Password` | password | hunter2 | `h******` |
-| `CarLicense` | licence plate | 京A12345 | `京A1**45` |
-| `BankCard` | bank card | 6222025678565678 | `6222 **** **** **** 5678` |
-| `IPV4` / `IPV6` | IP address | 192.168.1.1 | `192.*.*.*` |
-| `PEMKey` | PEM key | -----BEGIN ... | header and footer kept, body masked |
-| `APIKey` / `Secret` | secret | sk-abcdefghijklmnopqrstuvwxyz | `sk-a*********************wxyz` |
-| `UserID` / `PlayerID` / `OrderNo` / `UUID` / `OpenID` / `Account` | identifiers | 1234567890 | `12******90` |
-| `CustomExtension` | custom | controlled by `DesensitizeOptions` | - |
+The **tag name** column is what you write in `desensitize:"..."`. The type name
+is the Go constant for `Desensitize(s, typ)`; writing a type name in a tag does
+not resolve and silently leaves the field untouched.
+
+| Tag name | Type | Description | Example input | Example output |
+|----------|------|------|----------|----------|
+| `name` | `ChineseName` | Chinese name | 张三丰 | `张**` |
+| `identityCard` / `idCard` | `IDCard` | national ID | 310101199001015678 | `310101********5678` |
+| `phoneNumber` / `phone` | `PhoneNumber` | phone number | 18175698789 | `181****8789` |
+| `mobilePhone` / `mobile` | `MobilePhone` | mobile number | 18175698789 | `181****8789` |
+| `address` | `Address` | address | 北京市朝阳区某某路99号 | `北京市朝*****99号` |
+| `email` | `Email` | email | zhangsanfeng@example.com | `z*********ng@example.com` |
+| `password` | `Password` | password | hunter2 | `h******` |
+| `carLicense` | `CarLicense` | licence plate | 京A12345 | `京A1**45` |
+| `bankCard` | `BankCard` | bank card | 6222025678565678 | `6222 **** **** **** 5678` |
+| `ipv4` / `ipv6` / `ip` | `IPV4` / `IPV6` | IP address | 192.168.1.1 | `192.*.*.*` |
+| `pemKey` | `PEMKey` | PEM key | -----BEGIN ... | header and footer kept, body masked |
+| `apiKey` / `apikey` / `api_key` | `APIKey` | API key | sk-abcdefghijklmnopqrstuvwxyz | `sk-a*********************wxyz` |
+| `secret` / `secretKey` / `secret_key` | `Secret` | secret | sk-abcdefghijklmnopqrstuvwxyz | `sk-a*********************wxyz` |
+| `userId` / `playerId` / `orderNo` / `uuid` / `openId` / `unionId` / `account` | `UserID` / `PlayerID` / `OrderNo` / `UUID` / `OpenID` / `Account` | identifiers | 1234567890 | `12******90` |
+| `jump(start,end,step)` | `CustomExtension` | custom range | ABCDEFGHIJKLMNOP | `ABC*********MNOP` |
+
+`CustomExtension` has no fixed tag name: it is driven by `DesensitizeOptions`
+through `Desensitize`, and the parameterized `jump` tag covers the same need
+declaratively. Every other type has at least one tag name, which a test enforces
 
 ### Custom desensitizers
 
